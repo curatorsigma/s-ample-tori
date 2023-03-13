@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: "Please cite this software as below."
+authors:
+  - family-names: Schleucher
+    given-names: Jonathan
+title: "S-Ample Tori associated to Q-étale algebras"
+version: 1.2023031301
+date-released: 2023-03-13
