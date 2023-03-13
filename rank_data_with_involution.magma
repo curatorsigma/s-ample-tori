@@ -1,0 +1,2970 @@
+// GLOBAL PARAMETERS
+// If true, will do some more sanity checks and thus raise errors early and in a more controlled way
+ENABLE_SANITY_CHECKS := true;
+// possible settings:
+// 0: only debug-output (in the case of an error)
+// 1: Only give information about s-ample subtori
+// 2: Give information about all subtori
+// 3: Notify when a complicated computation starts
+VERBOSITY := 2;
+
+function flatten_list(list)
+    complete_list := [**];
+    for index in [1..#list] do
+        if Type(list[index]) eq Type([]) or Type(list[index]) eq Type([**]) then
+            complete_list cat:= flatten_list(list[index]);
+        else
+            Append(~complete_list, list[index]);
+        end if;
+    end for;
+    return complete_list;
+end function;
+
+function inject_as_block(matrix, i, j, n : field:=Rationals())
+    // Inject matrix as Block i, j in an nxn-Matrix
+    //
+    // INPUTS
+    //      Matrix matrix: blockmatrix to insert
+    //      RngIntElt i: the row to insert into
+    //      RngIntElt j: the column to insert into
+    //      RngIntElt n: the size of the full matrix (NumberOfRows(OUTPUT))
+    //      field:=Rationals() : the field to define the matrix over (no checks are done. ensure that matrix is defined over field)
+    // OUTPUTS
+    //      Matrix: matrix at the correct spot in a block-matrix
+    block_dimension := NumberOfRows(matrix);
+    num_of_blocks := n / block_dimension;
+    return BlockMatrix([[(k eq i and l eq j) select matrix else ZeroMatrix(field, block_dimension, block_dimension) :
+                         l in [1..num_of_blocks]] :
+                        k in [1..num_of_blocks]]);
+end function;
+
+function coordinates_in_basis(x, basis)
+    // Give the coordinates of the matrix x relative to `basis'
+    //
+    // INPUTS
+    //  Q-Matrix x
+    //  List[Element of Parent(x)] basis
+    // OUTPUTS
+    //  List[Coordinates of x relative to basis]
+    // ASSUMPTIONS
+    //  basis needs not be a basis of Parent(x), only be a linearly independent set of matrices with x \in span_Q(basis)
+    M := Parent(x);
+    B := Basis(M);
+    basis_matrix := Matrix(Rationals(), [Coordinates(M, b) : b in basis]);
+    n := Degree(M);
+    sol := Solution(basis_matrix, Vector(Rationals(), Coordinates(MatrixAlgebra(Rationals(), n), x)));
+    return Coordinates(VectorSpace(Rationals(), #basis),
+                       sol);
+end function;
+
+function coordinates_in_basis_fld(x, basis)
+    // Give the coordinates of the numberfieldelement x relative to `basis'
+    //
+    // INPUTS
+    //  FldNumElt x
+    //  List[Element of Parent(x)] basis
+    // OUTPUTS
+    //  List[Coordinates of x relative to basis]
+    // ASSUMPTIONS
+    //  basis needs not be a basis of Parent(x), only be a linearly independent set of elements with x \in span_K(basis)
+    //      where K is the Field of Coefficients of Parent(x)
+    // NOTES
+    //  when Parent(x) is defined as an extension of K:
+    //      Basis must be K-Basis of Parent(x) and the returned coordinates are elements of K relative to this K-Basis
+
+    M := Parent(x);
+    B := Basis(M);
+    K := BaseRing(M);
+    basis_matrix := Matrix(K, [Eltseq(b, K) : b in basis]);
+    sol := Solution(basis_matrix, Vector(K, Eltseq(x, K)));
+    return Coordinates(VectorSpace(K, #basis),
+                       sol);
+end function;
+
+function frobenius_block_of_polynomial(poly :  field:=Rationals())
+    // Create the frobeniusblockmatrix associated to the normed polynomial `poly'.
+
+    // INPUTS
+    //     normed polynomial poly
+    // OUTPUT
+    //     matrix(QQbar, [[coeffs]]) frobeniusblockmatrix
+    coeffs := Coefficients(poly);
+    n := #coeffs - 1;
+    columns := [];
+
+    for col := 1 to n-1 do
+        single_col := [];
+        for row := 1 to n do
+            Append(~single_col, (row eq col + 1) select (field ! 1) else (field ! 0));
+        end for;
+        Append(~columns, single_col);
+    end for;
+    
+    last_col := [];
+    for row := 1 to n do
+        Append(~last_col, - coeffs[row]);
+    end for;
+    Append(~columns, last_col);
+    return Transpose(Matrix(field, n, n, columns));
+end function;
+
+function eval_involution(tau, x)
+    // INPUTS
+    //      Rational n^2xn^2-Matrix tau: action of the involution on the basiselements of the full matrix algebra
+    //      Rational nxn-Matrix x: element of the full matrix algebra
+    // OUTPUTS
+    //      BaseRing(Parent(tau)) nxn Matrix tau(x)
+    K := BaseRing(Parent(tau));
+    n := NumberOfRows(x);
+    return Matrix(K, n, n,
+                  Coordinates(VectorSpace(K, n^2),
+                              Vector(K,
+                                     Coordinates(MatrixAlgebra(K, n), x)) * tau));
+end function;
+
+function eval_involution_of_second_kind(tau, a, q_basis_of_l, L)
+    n := Floor(Root(#tau, 2));
+    res := ZeroMatrix(L, n, n);
+    for i in [1..n] do
+        for j in [1..n] do
+            coeffs_of_aij := coordinates_in_basis_fld(L ! a[i][j], q_basis_of_l);
+            res +:= &+[&+[q_basis_of_l[qbindex] * tau[(imrow - 1) * n + imcol][(i - 1) * n + j][qbindex][lindex] * coeffs_of_aij[lindex] *
+                  Matrix(SparseMatrix(L, n, n, [<imrow, imcol, 1>]))
+                  : qbindex in [1..#q_basis_of_l], lindex in [1..#q_basis_of_l]]:
+               imrow in [1..n], imcol in [1..n]];
+        end for;
+    end for;
+    return res;
+end function;
+
+
+function get_generators_of_torus(torus, gens)
+    // given a torus-definition and the generators of the irreducibles, find a list of generators of the whole torus
+    //
+    // INPUTS
+    //      list[list[0 or 1]] torus: 1 if the relevant irreducible vanishes on torus, 0 else
+    //      list[list[Matrix]] gens: Generators of the irreds
+    //  Both are first grouped by field in the etale-algebra, then by the irreducible subrep of X^*(T)
+    // OUTPUTS
+    //      list[Matrix] elements generating the torus together
+    generators := [];
+    // field_mult: list of generators for all occurrances of one field
+    // field_gens: the generators for a single occurrance of this field
+    // NumberOfRows(field_gens[1]): the Q-dimension of a single occurrance of this field
+
+    ns := [[NumberOfRows(field_gens[1]) : field_gens in field_mult] : field_mult in gens];
+    // loop over the fields in the etale-algebra
+    for field_nr := 1 to #torus do
+        for mult_index in [1..#torus[field_nr]] do
+            subrep_definition := torus[field_nr][mult_index];
+            // get generators of irreducible parts
+            for subrep_nr in [1..#subrep_definition] do
+                // ignore subreps on which the torus is trivial
+                if subrep_definition[subrep_nr] eq 1 then
+                    continue subrep_nr;
+                else
+                    generator := gens[field_nr][mult_index][subrep_nr];
+                end if;
+
+                // pad with diagonal ones in all other fields
+                // ones prefixed if there are more prior occurances of this same field
+                prefix_ones := (mult_index eq 1) select 0 else &+[ns[field_nr][i] : i in [1..mult_index - 1]];
+                // ones prefixed if there are other fields before this one
+                prefix_ones := prefix_ones + &+[Rationals() | &+ns[j] : j in [1..field_nr-1]];
+
+                // ones postfixed if there are more later occurances of this field
+                postfix_ones := (mult_index eq #torus[field_nr]) select 0 else &+[ns[field_nr][i] : i in [mult_index + 1..#torus[field_nr]]];
+                // ones postfixed if there are more occurances of other fields later on
+                postfix_ones := postfix_ones + &+[Rationals() | &+ns[j] : j in [field_nr+1..#ns]];
+
+                if prefix_ones eq 0 then
+                    if postfix_ones eq 0 then
+                        Append(~generators, generator);
+                    else
+                        Append(~generators,
+                            DiagonalJoin(
+                                <generator,
+                                 DiagonalMatrix([Rationals() | 1 : el in [1..postfix_ones]])>));
+                    end if;
+                else
+                    if postfix_ones eq 0 then
+                        Append(~generators,
+                            DiagonalJoin(
+                                <DiagonalMatrix([Rationals() | 1 : el in [1..prefix_ones]]),
+                                 generator>));
+                    else
+                        Append(~generators,
+                            DiagonalJoin(
+                                <DiagonalMatrix([Rationals() | 1 : el in [1..prefix_ones]]),
+                                 generator,
+                                 DiagonalMatrix([Rationals() | 1 : el in [1..postfix_ones]])>));
+                    end if;
+                end if;
+            end for;
+        end for;
+    end for;
+    // use the diagonal product of these generators for the whole torus
+    return generators;
+end function;
+
+function ranks_of_nonirred_torus(torus, all_rank_datum, set_of_places)
+    // Given a Torus in irred-structure and the complete rank datum of irreducible tori, calculate the rank of torus
+    // 
+    // INPUTS
+    //     tuple<tuple<0 or 1>> torus given in internal structure, specifying the q-irreducible subreps of the charactergroups
+    //         which vanish on the torus
+    //     list[list[AssociativeArray(place, rank)]] all_rank_datum:
+    //         outer list has one element for each numberfield
+    //         inner list has one element for each Q-irreducible subrep of the numberfield
+    //         associative Array links place to rank (where place=0 stands for the rank over Q)
+    //     List[Finie Primie or Infinity] set_of_places: the relevant places; also calculates the Q-rank
+    // OUTPUT
+    //     AssociativeArray(RngIntElt or Infinity(), rank at the place or over Q for key==0)
+
+    ranks := AssociativeArray();
+    for place in set_of_places do
+        ranks[place] := 0;
+    end for;
+    ranks[0] := 0;
+    for nf_index in [1..#torus] do
+        for mult_index in [1..#torus[nf_index]] do
+            for kernel_index in [1..#torus[nf_index][mult_index]] do
+                if torus[nf_index][mult_index][kernel_index] eq 0 then
+                    for place in set_of_places do
+                        ranks[place] := ranks[place] + all_rank_datum[nf_index][mult_index][kernel_index][place];
+                    end for;
+                    ranks[0] := ranks[0] + all_rank_datum[nf_index][mult_index][kernel_index][0];
+                end if;
+            end for;
+        end for;
+    end for;
+    return ranks;
+end function;
+
+function Phi_b_trivial_type(F, K, b)
+    // Calculate the trace-form on Parent(b) in a Blockbasis relative to K with the trivial involution on F
+    //
+    // INPUTS
+    //  FldNum F: the Fixed field unter the involution of Parent(b)
+    //  FldNum K: a subfield of Parent(b) to be used in the Blockbasis
+    //  FldNumElt b: The twist for the trace-form
+    // OUTPUTS
+    //  Q-Matrix defining the trace-form on Parent(b)
+    // ASSUMPTIONS
+    //  b in F
+
+    n := Degree(F, Rationals());
+    Phi_b_entries := [];
+    R<x> := PolynomialRing(Rationals());
+    f := DefiningPolynomial(K);
+
+    // MAGMA has a weird problem, where the code in else does not work if K and E are isomorphic
+    // embed K into E via one of the roots of f;
+    if not IsSubfield(K, F) then
+        Embed(K, F, Roots(f, F)[1][1]);
+    end if;
+    if Degree(f) eq n then
+        M := K;
+        q_basis_of_m := Basis(K);
+    else
+        // Go to a field isomorphic to E, which is defined over K
+        M := RelativeField(K, F);
+        q_basis_of_m := [(M ! l) * (M ! k) : l in Basis(K), k in Basis(M)];
+    end if;
+    // MAGMA is weird, we have to force it to accept this isomorphism to be able to coerce into M later on
+    tmp := IsIsomorphic(M, F);
+
+    for i in [1..n] do
+        Append(~Phi_b_entries, []);
+        for j in [1..n] do
+            Append(~Phi_b_entries[i],
+                   Trace((M ! q_basis_of_m[i]) * (M ! b) * (M ! q_basis_of_m[j]),
+                         Rationals()));
+        end for;
+    end for;
+    return Matrix(Rationals(), Phi_b_entries);
+end function;
+
+function Phi_b_square_extension(F, K, b)
+    // Calculate the trace-form on Parent(b) in a Blockbasis relative to K
+    //
+    // INPUTS
+    //  FldNum F: the Fixed field unter the involution of Parent(b)
+    //  FldNum K: a subfield of Parent(b) to be used in the Blockbasis
+    //  FldNumElt b: The twist for the trace-form
+    // OUTPUTS
+    //  Q-Matrix defining the trace-form on Parent(b)
+    // ASSUMPTIONS
+    //  Parent(b)|F is degree-2 extension of NumberFields
+
+    Phi_b_entries := [];
+    R<x> := PolynomialRing(Rationals());
+    E := Parent(b);
+    f := DefiningPolynomial(K);
+    n := Degree(E, Rationals());
+
+    // MAGMA has a weird problem, where the code in else does not work if K and E are isomorphic
+    // embed K into E via one of the roots of f;
+    if not IsSubfield(K, E) then
+        Embed(K, E, Roots(PolynomialRing(E) ! f)[1][1]);
+    end if;
+    if Degree(f) eq Degree(E, Rationals()) then
+        M := K;
+        q_basis_of_m := IntegralBasis(K);
+    else
+        // Go to a field isomorphic to E, which is defined over K
+        M := RelativeField(K, E);
+        q_basis_of_m := [(M ! l) * (M ! k) : l in IntegralBasis(K), k in Basis(MaximalOrder(M))];
+    end if;
+    // MAGMA is weird, we have to force it to accept this isomorphism to be able to coerce into M later on
+    tmp := IsIsomorphic(M, E);
+    Auts, _, map := AutomorphismGroup(E, F);
+    sigma := map(Random(Generators(Auts)));
+
+    for i in [1..n] do
+        Append(~Phi_b_entries, []);
+        for j in [1..n] do
+            Append(~Phi_b_entries[i],
+                   Trace((M ! q_basis_of_m[i]) * (M ! b) * (M ! sigma(M ! q_basis_of_m[j])),
+                         Rationals()));
+        end for;
+    end for;
+    return Matrix(Rationals(), Phi_b_entries);
+end function;
+
+function Phi_b_swap_type(F, K, b)
+    // calculate the traceform on F + F with the swap as involution
+    //
+    // INPUTS
+    //      NumberField F
+    //      FldNum K: (field isomorphic to a) subfield K < F
+    //      List[b_1, b_2] such that b_1, b_2 in F
+    // OUTPUTS
+    //      AlgMatElt The Matrix with phi_b(e_i, e_j) as the i,i-entry
+    // NOTES
+    //      Uses the standard E-Basis ((f_1, 0), ..., (f_n, 0), (0, f_1), ..., (0, f_n))
+    //      And then transform into the K-block-basis
+    //      phi_b(x, y) := tr_{E|Q}(sigma(x) * b * y) where E := F + F
+
+    // Get K as a subfield of F
+    if not IsSubfield(K, F) then
+        Embed(K, F, Roots(DefiningPolynomial(K), F)[1][1]);
+    end if;
+    if not Degree(K, Rationals()) eq Degree(F, Rationals()) then
+        M := RelativeField(K, F);
+    else
+        R<x> := PolynomialRing(Rationals());
+        M := ext<K | x - 1 : DoLinearExtension:=true>;
+    end if;
+    // MAGMA is weird
+    _ := IsIsomorphic(F, M);
+
+    // Ich brauche eine block-basis relativ zu IntegralBasis(K)
+    q_basis_of_m := [(M ! k) * (M ! l) : k in Basis(MaximalOrder(M)), l in IntegralBasis(K)];
+    Phi_b_top_right := [];
+    Phi_b_bot_left := [];
+    n := 2 * Degree(F, Rationals());
+
+    for i in [1..n] do
+        if i in [1..n/2] then
+            Append(~Phi_b_top_right, []);
+            for j in [n/2+1..n] do
+                // e_i in first F, e_j in second F, sigma(e_j) in first F => trace non-zero
+                Append(~Phi_b_top_right[i],
+                       Trace((M !q_basis_of_m[i]) * (M ! b[1]) * (M ! q_basis_of_m[Floor(j - n/2)]), Rationals()));
+            end for;
+        else
+            Append(~Phi_b_bot_left, []);
+            for j in [1..n/2] do
+                // e_i in second F, e_j in first F, sigma(e_j) in second F => trace non-zero
+                Append(~Phi_b_bot_left[Floor(i -  n/2)],
+                       Trace((M ! q_basis_of_m[Floor(i - n/2)]) * (M ! b[2]) * (M ! q_basis_of_m[j]), Rationals()));
+            end for;
+        end if;
+    end for;
+    // We transform each of the two nontrivial blocks first (we change basis in each copy of F separately)
+    // calculate the transformation matrix
+    // this gets the components of each b in terms of the Basis {k_1, ..., k_n, e_1 * k_1, ..., e_r * k_n}
+    tmp := [[coordinates_in_basis_fld(el_in_k, IntegralBasis(K)) : el_in_k in coordinates_in_basis_fld(M ! b, Basis(MaximalOrder(M)))] : b in q_basis_of_m];
+    base_change_to_block_basis := Transpose(Matrix(Rationals(),
+        [[tmp[i][j][k] : j in [1..Degree(M, K)], k in [1..Degree(K)]] : i in [1..#tmp]]));
+    Phi_b_top_right_block_basis := Transpose(base_change_to_block_basis) * Matrix(Rationals(), Phi_b_top_right) * base_change_to_block_basis;
+    Phi_b_bot_left_block_basis := Transpose(base_change_to_block_basis) * Matrix(Rationals(), Phi_b_bot_left) * base_change_to_block_basis;
+
+    return BlockMatrix(2,
+                       2,
+                       [ZeroMatrix(Rationals(), Floor(n/2)),
+                        Phi_b_top_right_block_basis,
+                        Phi_b_bot_left_block_basis,
+                        ZeroMatrix(Rationals(), Floor(n/2))]);
+end function;
+
+function calculate_full_involution(fixed_etale_algebra, L, ds, b)
+    // Calculate the Involution tau corresponding to tr(x * b * sigma(y)) over the Transpose as base involution.
+    // INPUTS
+    //      List[Tuple<FldNum, RngIntElt>] fixed_etale_algebra: The Etale algebra fixed by sigma
+    //      FldNum L: Subfield which is supposed to be embedded in blocks
+    //      List[List[FldNumElt]] ds: the element such that the complete Etale-Algebra is F[ds]
+    //      List[List[FldNumElt]] b: The element b that defines the skewed trace form
+    // OUTPUTS
+    //      AlgMat: The complete Matrix Algebra tau acts on
+    //      AlgMatElt: tau as an n^2-matrix acting on the complete Algebra by left-multiplication
+    // ALGORITHM
+    //      Own, using the proof of [Knust, Merkurjev, Rost, Tignol; Prop 4.1]
+
+    // calculate also the Matrix Phi_b giving tr(x*b*sigma(y)) as x^T * Phi_b * y
+    // where y \in E. Find the associated Bases in Phi_b_swap_type and Phi_b_square_extension
+    // The Bases are such that L embeds through the diagonal repeat of its left-regular
+    //   (that is L = mu(L) + ... + mu(L))
+    // in the comments inside the following loop
+    Phi_b_diagonal_blocks := [**];
+    for field_nr in [1..#fixed_etale_algebra] do
+        F := fixed_etale_algebra[field_nr][1];
+        mult := fixed_etale_algebra[field_nr][2];
+        for i in [1..mult] do
+            d_ind := ds[field_nr][i];
+            // cf. Garibaldi, Rapinchuk 2.2 for proof of completeness of this case differentiation
+            if d_ind eq 0 then
+                // E_field_nr = F, tau is trivial
+                Append(~Phi_b_diagonal_blocks, Phi_b_trivial_type(F, L, b[field_nr][i]));
+            elif IsSquare(d_ind) then
+                // E_field_nr = F + F, tau swaps componentes
+                // calculate Phi_b on E=F+F
+                Append(~Phi_b_diagonal_blocks, Phi_b_swap_type(F, L, b[field_nr][i]));
+            else
+                // calculate Phi_b on E=F[sqrt(d)]
+                Append(~Phi_b_diagonal_blocks, Phi_b_square_extension(F, L, b[field_nr][i]));
+            end if;
+        end for;
+    end for;
+    Phi_b := DiagonalJoin(<el : el in Phi_b_diagonal_blocks>);
+    n := NumberOfRows(Phi_b);
+
+    // the full involution is given by tau(a) = Phi_b^T^{-1} * a^T * Phi_b^T)
+    M := MatrixAlgebra(Rationals(), n);
+    Phi_b_transpose := Transpose(Phi_b);
+    Phi_b_transpose_inverse := Phi_b_transpose^-1;
+    tau_on_M_n := [];
+    basis_M := Basis(M);
+    for a in basis_M do
+        tau_a := Phi_b_transpose_inverse * Transpose(a) * Phi_b_transpose;
+        Append(~tau_on_M_n, Coordinates(M, tau_a));
+    end for;
+
+    tau := Matrix(Rationals(), tau_on_M_n);
+    if ENABLE_SANITY_CHECKS and not tau^2 eq IdentityMatrix(Rationals(), NumberOfRows(tau)) then
+        print("tau is not an involution");
+        print(tau);
+        print("tau^2");
+        print(tau^2);
+        _ := ["Internal Error. See output above.", <1>];
+    end if;
+
+    return M, tau, IntegralBasis(L);;
+end function;
+
+function left_reg_with_integral_basis(gen, F)
+    // For an element gen of F, calculate its left-regular representation via an integral basis
+    //
+    //  INPUTS
+    //      FldNumElt gen in F
+    //      FldNum F
+    //  OUTPUTS
+    //      Rational Matrix representing gen
+
+    q_basis_of_f := [F ! el : el in IntegralBasis(F)];
+    q_basis_of_embedded_f := [];
+    for b in q_basis_of_f do
+        left_reg_coords := [coordinates_in_basis_fld(b * c, q_basis_of_f) : c in q_basis_of_f];
+        Append(~q_basis_of_embedded_f, Transpose(Matrix(Rationals(), left_reg_coords)));
+    end for;
+    return &+[coordinates_in_basis_fld(gen, q_basis_of_f)[i] * q_basis_of_embedded_f[i] : i in [1..Degree(F, Rationals())]];
+end function;
+
+function find_generating_element_in_F_emptyset_point(subrep_nr, irreducible_subreps, X_F, F, Fhat)
+    // Find a generator of the irreducible Subtorus corresponding to the subrep_nr-th subrep of irreducible_subreps for the swap case
+    // 
+    // INPUTS
+    //      RngIntElt subrep_nr: number of the subrep we are interested in
+    //      list[list[ModGrpElt]] irreducible_subreps: Irreducible Subrepresentations of the galoisaction on
+    //                                                 the charactergroup of the torus, given by a spanning set
+    //                                                 for each subrepresentation
+    //      GModule X_F: characters of F
+    //      FldNum F
+    //      FldNum Fhat: NormalClosure(F)
+    // OUTPUTS
+    //      FldNumElt f in F: an integral point generating the torus (of infinite order killing all other characters)
+    // ASSUMPTIONS
+    //      Torus needs to be {Infinity()}-noncompact
+
+    // get the list of characters that need to vanish on t
+    // (they are the characters in X_S not in irreducible_subreps[subrep_nr])
+    characters_killing_t := [];
+    for irred_nr in [1..#irreducible_subreps] do
+        if irred_nr eq subrep_nr then
+            continue irred_nr;
+        end if;
+        for char in irreducible_subreps[irred_nr] do
+            char_on_X_F := X_F ! char;
+            Append(~characters_killing_t,
+                   LeastCommonMultiple([Denominator(char_on_X_F[i]) : i in [1..Dimension(X_F)]]) * char_on_X_F);
+        end for;
+    end for;
+
+    OF, iota_OF := UnitGroup(F);
+    if VERBOSITY ge 3 and Degree(Fhat) gt 5 then
+        printf "\n>>I am now calculating the unit group of %o. This might take a while...", Fhat;
+    end if;
+    OFhat, iota_OFhat := UnitGroup(Fhat);
+    if VERBOSITY ge 3 and Degree(Fhat) gt 5 then
+        printf "Done.\n";
+    end if;
+
+    fF := DefiningPolynomial(F);
+    G, _, iota_G := AutomorphismGroup(Fhat, Rationals());
+    lifted_roots := [];
+    roots := [el[1] : el in Roots(fF, Fhat)];
+    for r in roots do
+        for g in G do
+            if iota_G(g)(Fhat ! F.1) eq r then
+                Append(~lifted_roots, g);
+                continue r;
+            end if;
+        end for;
+    end for;
+
+    // for each character t has to kill, generate the character as a hom O_E,S -> O_Ehat,S
+    homs := [];
+    for char in characters_killing_t do
+        // char is a formal direct sum of roots
+        // we have them represented in Gal(Fhat|Q) in lifted_roots
+        Append(~homs,
+               hom<OF -> OFhat |
+                    [Inverse(iota_OFhat)(Fhat ! &*[iota_G(lifted_roots[j])(Fhat ! iota_OF(OF.i))^(Integers() ! char[j])
+                     : j in [1..#roots]]) : i in [1..Ngens(OF)]]>);
+    end for;
+
+    // calculate the kernel of all these characters
+    // and the condition x * sigma(x) = 1
+    common_kernel := OF;
+    for hom in homs do
+        common_kernel meet:= Kernel(hom);
+    end for;
+
+    // find a generating element
+    for of in Generators(common_kernel) do
+        if Order(of) eq 0 then
+            return F ! iota_OF(of), [F ! iota_OF(el) : el in Generators(common_kernel) | Order(el) eq 0];
+        end if;
+    end for;
+end function;
+
+function find_generating_element_in_F(subrep_nr, irreducible_subreps, F, X_F, set_of_places, Fhat)
+    // Find an Element of F generating the irreducible Subtorus corresponding to the subrep_nr-th subrep of irreducible_subreps in the charactergroup.
+    // 
+    // INPUTS
+    //      RngIntElt subrep_nr: number of the subrep we are interested in
+    //      list[list[ModGrpElt]] irreducible_subreps: Irreducible Subrepresentations of the galoisaction on
+    //                                                 the charactergroup of the torus, given by a spanning set
+    //                                                 for each subrepresentation
+    //      FldNum F: Numberfield giving the Torus as F^\times
+    //      X_F: rep of the torus
+    //      list[Infinity() or Finite Prime]: Places to use
+    // OUTPUTS
+    //      FldNumElt gen in F such that the regular rep of gen gives a generating element of the Torus
+    // ASSUMPTIONS
+    //      Torus needs to be set_of_places-noncompact
+
+    // get the list of characters that need to vanish on t
+    // (they are the characters in X_S not in irreducible_subreps[subrep_nr])
+    characters_killing_t := [];
+    for irred_nr in [1..#irreducible_subreps] do
+        if irred_nr eq subrep_nr then
+            continue irred_nr;
+        end if;
+        for char in irreducible_subreps[irred_nr] do
+            char_on_X_F := X_F ! char;
+            Append(~characters_killing_t,
+                   LeastCommonMultiple([Denominator(char_on_X_F[i]) : i in [1..Dimension(X_F)]]) * char_on_X_F);
+        end for;
+    end for;
+
+    // get the S-unit group of F
+    places_in_F := [];
+    places_in_Fhat := [];
+    for p in set_of_places do
+        if p eq Infinity() then
+            continue p;
+        end if;
+        places_in_F cat:= [Ideal(el[1]) : el in Decomposition(F, p)];
+        places_in_Fhat cat:= [Ideal(el[1]) : el in Decomposition(Fhat, p)];
+    end for;
+
+    if #places_in_F eq 0 then
+        return find_generating_element_in_F_emptyset_point(subrep_nr, irreducible_subreps, X_F, F, Fhat);
+    end if;
+
+    OF, iota_OF := SUnitGroup(places_in_F);
+    if VERBOSITY ge 3 and Degree(Fhat) gt 5 then
+        printf ">>I am now calculating the S-unit group of %o at %o places. This might take a while...", Fhat, #places_in_Fhat;
+    end if;
+    OFhat, iota_OFhat, OFhat_Base := SUnitGroup(places_in_Fhat : Raw);
+    if VERBOSITY ge 3 and Degree(Fhat) gt 5 then
+        print("Done.");
+    end if;
+
+    // lift the roots to Gal(Fhat|Q)-elements
+    fF := DefiningPolynomial(F);
+    G, _, iota_G := AutomorphismGroup(Fhat, Rationals());
+    lifted_roots := [];
+    roots := [el[1] : el in Roots(fF, Fhat)];
+    for r in roots do
+        for g in G do
+            if iota_G(g)(roots[1]) eq r then
+                Append(~lifted_roots, g);
+                continue r;
+            end if;
+        end for;
+    end for;
+
+    // for each character t has to kill, generate the character as a hom O_F,S -> O_Fhat,S
+    homs := [];
+    for char in characters_killing_t do
+        // char is a formal direct sum of roots
+        // we have them represented in Gal(Ehat|Q) in lifted_roots
+        Append(~homs,
+               hom<OF -> OFhat | 
+                SUnitDiscLog(iota_OFhat,
+                             [Fhat ! &*[iota_G(lifted_roots[j])(Fhat ! iota_OF(OF.i))^(Integers() ! char[j]) : j in [1..#roots]] : i in [1..Ngens(OF)]],
+                             places_in_Fhat : Base:=OFhat_Base)>);
+    end for;
+
+    // calculate the kernel of all these characters
+    common_kernel := OF;
+    for hom in homs do
+        common_kernel meet:= Kernel(hom);
+    end for;
+
+    for of in Generators(common_kernel) do
+        if Order(of) eq 0 then
+            return F ! iota_OF(of), [F ! iota_OF(el) : el in Generators(common_kernel) | Order(el) eq 0];
+        end if;
+    end for;
+end function;
+
+function find_generator_irred_trivial(subrep_nr, irreducible_subreps, F, X_F, set_of_places, Fhat)
+    // Find a generator of the irreducible Subtorus corresponding to the subrep_nr-th subrep of irreducible_subreps in the charactergroup.
+    // 
+    // INPUTS
+    //      RngIntElt subrep_nr: number of the subrep we are interested in
+    //      list[list[ModGrpElt]] irreducible_subreps: Irreducible Subrepresentations of the galoisaction on
+    //                                                 the charactergroup of the torus, given by a spanning set
+    //                                                 for each subrepresentation
+    //      FldNum F: Numberfield giving the Torus as F^\times
+    //      X_F: rep of the torus
+    //      list[Infinity() or Finite Prime]: Places to use
+    // OUTPUTS
+    //      Matrix: An Element t of the Torus such that T = closure(<t>)
+    // ASSUMPTIONS
+    //      Torus needs to be set_of_places-noncompact
+
+    // If the Torus has Q-Rank, the normal procedure does not work. instead just choose 2 as the generating element
+    // check if this subrep is the normcharacter of F
+    if irreducible_subreps[subrep_nr][1] eq X_F ! [1 : i in [1..Degree(F)]] then
+        return 2 * IdentityMatrix(Rationals(), Degree(F));
+    end if;
+
+    fF := DefiningPolynomial(F);
+
+    gen, all_gens := find_generating_element_in_F(subrep_nr, irreducible_subreps, F, X_F, set_of_places);
+
+    // Write this generator as a matrix
+    gen_as_matrix := left_reg_with_integral_basis(gen, F);
+    return gen_as_matrix, [left_reg_with_integral_basis(el, F) : el in all_gens];
+end function;
+
+function find_generator_irred_swap(subrep_nr, irreducible_subreps, F, X_F, set_of_places, Fhat)
+    // Find a generator of the irreducible Subtorus corresponding to the subrep_nr-th subrep of irreducible_subreps in the charactergroup.
+    // 
+    // INPUTS
+    //      RngIntElt subrep_nr: number of the subrep we are interested in
+    //      list[list[ModGrpElt]] irreducible_subreps: Irreducible Subrepresentations of the galoisaction on
+    //                                                 the charactergroup of the torus, given by a spanning set
+    //                                                 for each subrepresentation
+    //      FldNum F: Numberfield giving the Torus as F^\times + F^\times^{-1}
+    //      X_F: rep of the torus
+    //      list[Infinity() or Finite Prime]: Places to use
+    //      FldNum Fhat: Normal Closure of F
+    // OUTPUTS
+    //      Matrix: An Element t of the Torus such that T = closure(<t>)
+    // ASSUMPTIONS
+    //      Torus needs to be set_of_places-noncompact
+
+    // If the Torus has Q-Rank, the normal procedure does not work. instead just choose 2 as the generating element
+    // check if this subrep is the normcharacter of F
+    if irreducible_subreps[subrep_nr][1] eq X_F ! [1 : i in [1..Degree(F)]] then
+        return DiagonalJoin(2 * IdentityMatrix(Rationals(), Degree(F)), 2^-1 * IdentityMatrix(Rationals(), Degree(F))), [DiagonalJoin(2 * IdentityMatrix(Rationals(), Degree(F)), 2^-1 * IdentityMatrix(Rationals(), Degree(F)))];
+    end if;
+
+    fF := DefiningPolynomial(F);
+
+    gen, all_gens := find_generating_element_in_F(subrep_nr, irreducible_subreps, F, X_F, set_of_places, Fhat);
+
+    // Write this generator as a matrix
+    gen_as_matrix := left_reg_with_integral_basis(gen, F);
+    return DiagonalJoin(gen_as_matrix, gen_as_matrix^-1), [DiagonalJoin(left_reg_with_integral_basis(el, F), left_reg_with_integral_basis(el, F)^-1) : el in all_gens];
+end function;
+
+function find_generator_irred_ext_emptyset_point(subrep_nr, irreducible_subreps, F, d, E, X_E, Ehat)
+    // Find a generator of the irreducible Subtorus corresponding to the subrep_nr-th subrep of irreducible_subreps in the charactergroup.
+    // 
+    // INPUTS
+    //      RngIntElt subrep_nr: number of the subrep we are interested in
+    //      list[list[ModGrpElt]] irreducible_subreps: Irreducible Subrepresentations of the galoisaction on
+    //                                                 the charactergroup of the torus, given by a spanning set
+    //                                                 for each subrepresentation
+    //      FldNum F
+    //      FldNumElt d in F: the numberfield and Element which gives the full torus as SU(F[sqrt(d)]), sqrt(d)->-sqrt(d))
+    //      FldNum E: F(sqrt(d))
+    // OUTPUTS
+    //      Matrix: An Element t of the Torus such that T = closure(<t>)
+    // ASSUMPTIONS
+    //      Torus needs to be {Infinity()}-noncompact
+
+    // get the list of characters that need to vanish on t
+    // (they are the characters in X_S not in irreducible_subreps[subrep_nr])
+    characters_killing_t := [];
+    for irred_nr in [1..#irreducible_subreps] do
+        if irred_nr eq subrep_nr then
+            continue irred_nr;
+        end if;
+        for char in irreducible_subreps[irred_nr] do
+            char_on_X_E := X_E ! char;
+            Append(~characters_killing_t,
+                   LeastCommonMultiple([Denominator(char_on_X_E[i]) : i in [1..Dimension(X_E)]]) * char_on_X_E);
+        end for;
+    end for;
+
+    OE, iota_OE := UnitGroup(E);
+    if VERBOSITY ge 3 and Degree(Ehat) gt 5 then
+        printf "\n>>I am now calculating the unit group of %o. This might take a while...", Ehat;
+    end if;
+    OEhat, iota_OEhat := UnitGroup(Ehat);
+    if VERBOSITY ge 3 and Degree(Ehat) gt 5 then
+        printf "Done.\n";
+    end if;
+
+    fE := DefiningPolynomial(E);
+    G, _, iota_G := AutomorphismGroup(Ehat, Rationals());
+    lifted_roots := [];
+    roots := [el[1] : el in Roots(fE, Ehat)];
+    for r in roots do
+        for g in G do
+            if iota_G(g)(Ehat ! E.1) eq r then
+                Append(~lifted_roots, g);
+                continue r;
+            end if;
+        end for;
+    end for;
+
+    // generate the relation t*sigma(t) as a hom O_E,S -> O_Ehat,S
+    // lift sigma to Gal(Ehat|Q)
+    G_EF, _, iota_G_EF := AutomorphismGroup(E, F);
+    sigma := iota_G_EF(Random(Generators(G_EF)));
+    homs := [hom<OE -> OEhat |
+                    [Inverse(iota_OEhat)(Ehat ! ((E ! iota_OE(OE.i)) * sigma(E ! iota_OE(OE.i)))) : i in [1..Ngens(OE)]]>];
+
+    // for each character t has to kill, generate the character as a hom O_E,S -> O_Ehat,S
+    for char in characters_killing_t do
+        // char is a formal direct sum of roots
+        // we have them represented in Gal(Ehat|Q) in lifted_roots
+        Append(~homs,
+               hom<OE -> OEhat | 
+                Inverse(iota_OEhat)(
+                    [Ehat ! &*[iota_G(lifted_roots[j])(Ehat ! iota_OE(OE.i))^(Integers() ! char[j])
+                     : j in [1..#roots]] : i in [1..Ngens(OE)]])>);
+    end for;
+
+    // calculate the kernel of all these characters
+    // and the condition x * sigma(x) = 1
+    common_kernel := OE;
+    for hom in homs do
+        common_kernel meet:= Kernel(hom);
+    end for;
+
+    // find a generating element
+    for oe in Generators(common_kernel) do
+        if Order(oe) eq 0 then
+            gen := E ! iota_OE(oe);
+        end if;
+    end for;
+
+    // Write this generator as a matrix
+    return left_reg_with_integral_basis(gen, E), [left_reg_with_integral_basis(E ! iota_OE(el), E) : el in Generators(common_kernel) | Order(el) eq 0];
+end function;
+
+function find_generator_irred_ext(subrep_nr, irreducible_subreps, F, d, E, X_E, set_of_places, Ehat, Fhat)
+    // Find a generator of the irreducible Subtorus corresponding to the subrep_nr-th subrep of irreducible_subreps in the charactergroup.
+    // 
+    // INPUTS
+    //      RngIntElt subrep_nr: number of the subrep we are interested in
+    //      list[list[ModGrpElt]] irreducible_subreps: Irreducible Subrepresentations of the galoisaction on
+    //                                                 the charactergroup of the torus, given by a spanning set
+    //                                                 for each subrepresentation
+    //      FldNum F
+    //      FldNumElt d in F: the numberfield and Element which gives the full torus as SU(F[sqrt(d)]), sqrt(d)->-sqrt(d))
+    //      FldNum E: F(sqrt(d))
+    //      List[finite Prime or Infinity()] set_of_places: the places we are allowed to use
+    // OUTPUTS
+    //      Matrix: An Element t of the Torus such that T = closure(<t>)
+    // ASSUMPTIONS
+    //      Torus needs to be set_of_places-noncompact
+
+    // We need E as an absolute field for this computation
+    E := AbsoluteField(E);
+
+
+    // get the S-unit group of E
+    places_in_E := [];
+    places_in_Ehat := [];
+    for p in set_of_places do
+        if p eq Infinity() then
+            continue p;
+        end if;
+        places_in_E cat:= [Ideal(el[1]) : el in Decomposition(E, p)];
+        places_in_Ehat cat:= [Ideal(el[1]) : el in Decomposition(Ehat, p)];
+    end for;
+    // SUnitGroup only works when we have at least one finite place
+    if #places_in_E eq 0 then
+        return find_generator_irred_ext_emptyset_point(subrep_nr, irreducible_subreps, F, d, E, X_E, Ehat);
+    end if;
+
+    // get the list of characters that need to vanish on t
+    // (they are the characters in X_S not in irreducible_subreps[subrep_nr])
+    characters_killing_t := [];
+    for irred_nr in [1..#irreducible_subreps] do
+        if irred_nr eq subrep_nr then
+            continue irred_nr;
+        end if;
+        for char in irreducible_subreps[irred_nr] do
+            char_on_X_E := X_E ! char;
+            Append(~characters_killing_t,
+                   LeastCommonMultiple([Denominator(char_on_X_E[i]) : i in [1..Dimension(X_E)]]) * char_on_X_E);
+        end for;
+    end for;
+
+    OE, iota_OE := SUnitGroup(places_in_E);
+    if VERBOSITY ge 3 and Degree(Ehat) gt 5 then
+        printf ">>I am now calculating the SUnitGroup of %o at %o ideals. This might take a while...", Ehat, #places_in_Ehat;
+    end if;
+    OEhat, iota_OEhat, OEhat_Base := SUnitGroup(places_in_Ehat : Raw);
+    if VERBOSITY ge 3 and Degree(Ehat) gt 5 then
+        print("Done.");
+    end if;
+
+    fE := DefiningPolynomial(E);
+    G, _, iota_G := AutomorphismGroup(Ehat, Rationals());
+    lifted_roots := [];
+    roots := [el[1] : el in Roots(fE, Ehat)];
+    for r in roots do
+        for g in G do
+            if iota_G(g)(roots[1]) eq r then
+                Append(~lifted_roots, g);
+                continue r;
+            end if;
+        end for;
+    end for;
+
+    // generate the relation t*sigma(t) as a hom O_E,S -> O_Ehat,S
+    // lift sigma to Gal(Ehat|Q)
+    G_EF, _, iota_G_EF := AutomorphismGroup(E, F);
+    sigma := iota_G_EF(Random(Generators(G_EF)));
+    homs := [hom<OE -> OEhat | 
+                SUnitDiscLog(iota_OEhat,
+                             [Ehat ! ((E ! iota_OE(OE.i)) * sigma(E ! iota_OE(OE.i))) : i in [1..Ngens(OE)]],
+                             places_in_Ehat : Base:=OEhat_Base)>];
+
+    // for each character t has to kill, generate the character as a hom O_E,S -> O_Ehat,S
+    for char in characters_killing_t do
+        // char is a formal direct sum of roots
+        // we have them represented in Gal(Ehat|Q) in lifted_roots
+        Append(~homs,
+               hom<OE -> OEhat | 
+                SUnitDiscLog(iota_OEhat,
+                             [Ehat ! &*[iota_G(lifted_roots[j])(Ehat ! iota_OE(OE.i))^(Integers() ! char[j]) : j in [1..#roots]] : i in [1..Ngens(OE)]],
+                             places_in_Ehat : Base:=OEhat_Base)>);
+    end for;
+
+    // calculate the kernel of all these characters
+    // and the condition x * sigma(x) = 1
+    common_kernel := OE;
+    for hom in homs do
+        common_kernel meet:= Kernel(hom);
+    end for;
+
+    for oe in Generators(common_kernel) do
+        if Order(oe) eq 0 then
+            gen := E ! iota_OE(oe);
+        end if;
+    end for;
+
+    // Write this generator as a matrix
+    return left_reg_with_integral_basis(gen, E), [left_reg_with_integral_basis(E ! iota_OE(el), E) : el in Generators(common_kernel) | Order(el) eq 0];
+end function;
+
+function find_generator_irred(subrep_nr, irreducible_subreps, F, d, E, X_E, set_of_places, Ehat, Fhat)
+
+    // Call the correct find_generator for a non-set_of_places-compact torus
+    if d eq 0 then
+        return find_generator_irred_trivial(subrep_nr, irreducible_subreps, F, X_E, set_of_places);
+    elif Degree(E, Rationals()) eq Degree(F) then
+        return find_generator_irred_swap(subrep_nr, irreducible_subreps, F, X_E, set_of_places, Fhat);
+    else
+        return find_generator_irred_ext(subrep_nr, irreducible_subreps, F, d, E, X_E, set_of_places, Ehat, Fhat);
+    end if;
+end function;
+
+function galois_representation_w_involution_ext(F, d, E, Ehat, Fhat)
+    // Calculate the action of the galois group of E:=F(sqrt(d)) on the characters of the torus {e \in E | e sigma(e) = 1}
+    //
+    // here, sigma is the unique nontrivial automorphism of E that fixes fixed_number_field
+    // INPUTS
+    //      FldNum F: The base numberfield
+    //      FldNumElt d: The element which is to become a square in E
+    //      FldNum E over F: F[sqrt(d)]
+    //      FldNum Ehat: NormalClosure(AbsoluteField(E))
+    // OUTPUTS
+    //      ModTup X_E: The character group of E as a Gal(Ehat|Q) module
+    //      ModTup X_S: The character group of S as a Gal(Ehat|Q) module
+    //      FldNum AbsoluteField(E): the Field E|Q
+    //      Homomorphism X_E -> X_S: The quotient map X_E ->> X_S
+    //      Gal_Ehat_Q_on_alphas: The permutationgroup isomorphic to Gal(Ehat|Q) acting on the module
+
+    E_abs := AbsoluteField(E);
+    f_E := DefiningPolynomial(E_abs);
+    // these roots form a Basis of the Characters of E
+    // calculate the action of the galois group of Ehat|Q on these roots
+    G, _, iota_G := AutomorphismGroup(Ehat, Rationals());
+    // find the Roots of f_E in Ehat
+    alphas := [el[1] : el in Roots(f_E, Ehat)];
+
+    gs_as_perm := AssociativeArray();
+    for g in G do
+        gs_as_perm[g] := [Index(alphas, iota_G(g)(alphas[i])) : i in [1..#alphas]];
+    end for;
+    Sn := Sym(Degree(E, Rationals()));
+    Gal_Ehat_Q_on_alphas := sub<Sn | [gs_as_perm[g] : g in G]>;
+    X_E := PermutationModule(Gal_Ehat_Q_on_alphas, Rationals());
+    // now calculate the image of X_F under the pullback along the norm
+    f_F := DefiningPolynomial(F);
+    // Magma is weird
+    Embed(Fhat, Ehat, Roots(DefiningPolynomial(Fhat), Ehat)[1][1]);
+    IsSubfield(Fhat, Ehat);
+    IsSubfield(E_abs, Ehat);
+    // find the roots of f_F in Fhat
+    betas := [el[1] : el in Roots(f_F, Fhat)];
+    // these roots form a Basis of the Characters of F
+    // calculate the (non-unique) associated elements of Gal(Ehat | Q) to these Roots
+    taus := [];
+    for beta in betas do
+        for g in G do
+            if iota_G(g)(Ehat ! F.1) eq (Ehat ! beta) then
+                Append(~taus, g);
+                continue beta;
+            end if;
+        end for;
+    end for;
+    // Lift Gal(E|F) to Gal(Ehat|Q)
+    Auts_E_F, _, iota_Aut_E_F := AutomorphismGroup(E, F);
+    // actually rho^\tilde in the notation of the proof
+    rhos := [];
+    for a in Auts_E_F do
+        for g in G do
+            // the lift must restric to the same action on the basis of E
+            if iota_G(g)(Ehat ! E_abs.1) eq iota_Aut_E_F(a)(E ! E_abs.1) then
+                // the lift also needs to be trivial on F because the elements of Gal(E|F) are
+                // we lift to Gal(Ehat|F) which then injects naturally into Gal(Ehat|Q)
+                if iota_G(g)(F.1) eq F.1 then
+                    Append(~rhos, g);
+                    continue a;
+                end if;
+            end if;
+        end for;
+    end for;
+
+    norm_pullback_taus := [];
+    for tau in taus do
+        indices_rhos_correspond_to := [];
+        for rho in rhos do
+            // calculate tau \circ rho (alpha_1). this gives us an alpha_k. tau*rho corresponds to the k-th basis vector of X_E
+            Append(~indices_rhos_correspond_to, Index(alphas, iota_G(tau)(iota_G(rho)(Ehat ! E_abs.1))));
+        end for;
+        // the pullback of tau under the norm, given in terms of the basis alphas of the module
+        Append(~norm_pullback_taus, X_E ! [#[i : i in [1..#rhos] | indices_rhos_correspond_to[i] eq k] : k in [1..#alphas]]);
+    end for;
+    norm_pullback_of_X_F := sub<X_E | norm_pullback_taus>;
+    X_S := quo<X_E | norm_pullback_of_X_F>;
+
+    if ENABLE_SANITY_CHECKS and not Dimension(X_S) eq Degree(E, Rationals()) - Degree(F) then
+        print("X_S has wrong dimension");
+        print(X_S);
+        print(X_E);
+        print("norm_pullback_taus");
+        print(norm_pullback_taus);
+        _ := ["See the debug-output above.", <1>];
+    end if;
+
+    return X_E, X_S, Morphism(X_E, X_S), Gal_Ehat_Q_on_alphas, Ehat;
+end function;
+
+function galois_representation_w_involution_swap(F, Fhat)
+    // Calculate the action of the galois group of Fhat acting on the Characters X(F^\times)
+    //
+    // INPUTS
+    //      FldNum F: The base numberfield
+    //      FldNum Fhat: NormalClosure(F)
+    // OUTPUTS
+    //      ModTup X_S: The character group of F as a Gal(Fhat|Q) module
+    //      ModTup X_S: The character group of F as a Gal(Fhat|Q) module
+    //      Homomorphism X_E -> X_S: The identity X_S ~->> X_S
+    //      Gal_Ehat_Q_on_alphas: The permutationgroup isomorphic to Gal(Fhat|Q) acting on the module
+
+    // S := SU(F+F, swap) ~= F^\times
+    // X^*(S) ~= X^*(F^\times)
+    if Degree(F) eq 1 then
+        X_S := GModule(Sym(1), Rationals());
+        Gal_Ehat_Q_on_alphas := Sym(1);
+    else
+        f_F := DefiningPolynomial(F);
+        // these roots form a Basis of the Characters of F
+        // calculate the action of the galois group of Fhat|Q on these roots
+        G, _, iota_G := AutomorphismGroup(Fhat, Rationals());
+        // find the Roots of f_E in Fhat
+        alphas := [el[1] : el in Roots(f_F, Fhat)];
+
+        gs_as_perm := AssociativeArray();
+        for g in G do
+            gs_as_perm[g] := [Index(alphas, iota_G(g)(alphas[i])) : i in [1..#alphas]];
+        end for;
+        Sn := Sym(Degree(F));
+        Gal_Ehat_Q_on_alphas := sub<Sn | [gs_as_perm[g] : g in G]>;
+        X_S := PermutationModule(Gal_Ehat_Q_on_alphas, Rationals());
+    end if;
+    return X_S, X_S, Morphism(X_S, X_S), Gal_Ehat_Q_on_alphas, Fhat;
+end function;
+
+function galois_representation_w_involution(F, d, E, Ehat, Fhat)
+    // Calculate the action of the galois group of E:=F(sqrt(d)) on the characters of the torus {e \in E | e sigma(e) = 1}
+    //
+    // here, sigma is the unique nontrivial automorphism of E that fixes fixed_number_field
+    // INPUTS
+    //      FldNum F: The base numberfield
+    //      FldNumElt d: The element which is to become a square in E
+    // OUTPUTS
+    //      ModTup X_E: The character group of E as a Gal(Ehat|Q) module
+    //      ModTup X_S: The character group of S as a Gal(Ehat|Q) module
+    //      Homomorphism X_E -> X_S: The quotient map X_E ->> X_S
+    //      Gal_Ehat_Q_on_alphas: The permutationgroup isomorphic to Gal(Ehat|Q) acting on the module
+    //      
+
+    if IsSquare(d) then
+        return galois_representation_w_involution_swap(F, Fhat);
+    else
+        return galois_representation_w_involution_ext(F, d, E, Ehat, Fhat);
+    end if;
+end function;
+
+function local_ranks_at_finite_place_ext(E, F, place_of_Q, X_E, irreds, quotient_map, Ehat, Fhat)
+    // Calculate the local ranks of all irreds of the charactergroup of E for the Extension-Type
+    //
+    // INPUTS
+    //      FldNum E: F[sqrt(d)]
+    //      FldNum F: fixed field under the involution
+    //      RngIntElt place_of_Q: prime to calculate rank at
+    //      ModTup X_E: Module giving the Gal(Ehat|Q) action on the characters of E^\times = R_E|Q(Gm)
+    //      List[List[ModTupElt]] irreds: irreducible subreps of X_E
+    //      Homomorphism quotient_map : X_E -> X(SU(E, sigma))xQ
+    //      FldNum Ehat: Normal Closure of E
+    //      FldNum Fhat: Normal Closure of F
+    // OUTPUTS
+    //      List[RngIntElt Q_p Rank of Irred at this Index]
+
+    f := DefiningPolynomial(AbsoluteField(E));
+    // get the decomposition of f in Q_p
+    Q_p := pAdicRing(place_of_Q, 20 * Degree(Ehat));
+    fact := Factorization(f, Q_p);
+    // loop over roots of f in Ehat (the points acted on)
+    root_sets := [[] : i in [1..#fact]];
+    alphas := [el[1] : el in Roots(f, Ehat)];
+
+    // find a root of f in Ehat completed at a place (i.E. a primitive element of the completion)
+    // Place in the decomposition is irrelevant, each yields an isomorphism
+    EhatP := Completion(Ehat, Decomposition(Ehat, place_of_Q)[1][1] : Precision:=20 * Degree(Ehat));
+    local_root := Roots(DefiningPolynomial(Ehat), EhatP)[1][1];
+    for alpha in alphas do
+        // calculate iota_alpha
+        // get alpha in terms of the Basis {1, Ehat.1, Ehat.1^2, ...} of Ehat
+        coeffs := ElementToSequence(alpha);
+        // use the coefficients of alpha in terms of the Basis of Ehat to create an element of EhatP
+        iota_alpha := &+[coeffs[i] * local_root^(i - 1) : i in [1..Degree(Ehat, Rationals())]];
+
+        // go over each irreducible in the factorization of f over the relevant Q_p
+        // and check if iota_alpha is a zero of g
+        for g_ind in [1..#fact] do
+            g := fact[g_ind][1];
+            ev := &+[Coefficients(g)[i] * iota_alpha^(i - 1) : i in [1..Degree(g) + 1]];
+            // IsZero is buggy (at least i don't understand when it returns true and when it doesn't)
+            // so I just use Valuation and hope that this is high enough
+            if Valuation(ev) gt 18 * Degree(Ehat) then
+                Append(~root_sets[g_ind], alpha);
+                continue alpha;
+            end if;
+        end for;
+    end for;
+
+    // create the corresponding local normcharacters in X_E
+    local_normcharacters_in_X_E := [X_E ! [(root in el) select 1 else 0 : root in alphas] : el in root_sets];
+    // push them to X_S
+    local_normcharacters_in_X_S := [quotient_map(el) : el in local_normcharacters_in_X_E];
+    local_normcharacters_in_X_S := flatten_list(local_normcharacters_in_X_S);
+
+    X_S := Parent(local_normcharacters_in_X_S[1]);
+    X_S_as_forgetful_vectorspace := VectorSpace(X_S);
+    T := sub<X_S_as_forgetful_vectorspace | [X_S_as_forgetful_vectorspace ! el : el in local_normcharacters_in_X_S]>;
+    // check if they intersect the relevant subrep and return the rank
+    return [Dimension(T meet sub<X_S_as_forgetful_vectorspace | [X_S_as_forgetful_vectorspace ! el : el in subrep]>) : subrep in irreds];
+end function;
+
+function local_ranks_at_finite_place_swap(F, place_of_Q, X_F, irreds, Fhat)
+    // Calculate the local ranks of all irreds of the charactergroup of F+F for the Swap-Type
+    //
+    // INPUTS
+    //      FldNum F: fixed field under the involution
+    //      RngIntElt place_of_Q: prime to calculate rank at
+    //      ModTup X_F: Module giving the Gal(Ehat|Q) action on the characters of F^\times = R_F|Q(Gm)
+    //      List[List[ModTupElt]] irreds: irreducible subreps of X_F
+    //      FldNum Fhat: Normal Closure of F
+    // OUTPUTS
+    //      List[RngIntElt Q_p Rank of Irred at this Index]
+
+    f := DefiningPolynomial(F);
+    // get the decomposition of f in Q_p
+    Q_p := pAdicRing(place_of_Q, 20 * Degree(Fhat));
+    fact := Factorization(PolynomialRing(Q_p) ! f);
+    // loop over roots of f in Ehat (the points acted on)
+    root_sets := [[] : i in [1..#fact]];
+    alphas := [el[1] : el in Roots(f, Fhat)];
+
+    // find a root of f in Ehat completed at a place (i.E. a primitive element of the completion)
+    // Place in the decomposition is irrelevant, each yields an isomorphism
+    FhatP := Completion(Fhat, Decomposition(Fhat, place_of_Q)[1][1] : Precision:=20 * Degree(Fhat));
+    local_root := Roots(DefiningPolynomial(Fhat), FhatP)[1][1];
+
+    for alpha in alphas do
+        // calculate iota_alpha
+        // get alpha in terms of the Basis {1, Ehat.1, Ehat.1^2, ...} of Ehat
+        coeffs := ElementToSequence(alpha);
+        // use the coefficients of alpha in terms of the Basis of Ehat to create an element of EhatP
+        iota_alpha := &+[coeffs[i] * local_root^(i - 1) : i in [1..Degree(Fhat, Rationals())]];
+
+        // go over each irreducible in the factorization of f over the relevant Q_p
+        // and check if iota_alpha is a zero of g
+        for g_ind in [1..#fact] do
+            g := fact[g_ind][1];
+            ev := &+[Coefficients(g)[i] * iota_alpha^(i - 1) : i in [1..Degree(g) + 1]];
+            // IsZero is buggy (at least i don't understand when it returns true and when it doesn't)
+            // so I just use Valuation and hope that 30 is high enough
+            if Valuation(ev) gt 18 * Degree(Fhat) then
+                Append(~root_sets[g_ind], alpha);
+                continue alpha;
+            end if;
+        end for;
+    end for;
+
+    // check which norm-characters are in each irred
+    // create the corresponding local normcharacters in X_F
+    local_normcharacters_in_X_F := [X_F ! [(root in group) select 1 else 0 : root in alphas] : group in root_sets];
+
+    X_F_as_forgetful_vectorspace := VectorSpace(X_F);
+    T := sub<X_F_as_forgetful_vectorspace | [X_F_as_forgetful_vectorspace ! el : el in local_normcharacters_in_X_F]>;
+    // check if they intersect the relevant subrep and return the rank
+    return [Dimension(T meet sub<X_F_as_forgetful_vectorspace | [X_F_as_forgetful_vectorspace ! el : el in subrep]>) : subrep in irreds];
+end function;
+
+function local_ranks_at_finite_place(E, F, place_of_Q, X_E, irreds, quotient_map, Ehat, Fhat)
+    // Call the correct local_rank-calculation
+    if Degree(E, Rationals()) eq Degree(F) then
+        return local_ranks_at_finite_place_swap(F, place_of_Q, X_E, irreds, Fhat);
+    else
+        return local_ranks_at_finite_place_ext(E, F, place_of_Q, X_E, irreds, quotient_map, Ehat, Fhat);
+    end if;
+end function;
+
+function local_ranks_at_infinite_place_swap(F, X_F, irreds, Fhat)
+    // Calculate the local ranks of all irreds of the charactergroup of F+F for the Swap-Type
+    //
+    // INPUTS
+    //      FldNum F: fixed field under the involution
+    //      ModTup X_F: Module giving the Gal(Ehat|Q) action on the characters of F^\times = R_F|Q(Gm)
+    //      List[List[ModTupElt]] irreds: irreducible subreps of X_F
+    //      Homomorphism quotient_map : X_F -> X(SU(E, sigma))xQ
+    // OUTPUTS
+    //      List[RngIntElt R Rank of Irred at this Index]
+
+    f := DefiningPolynomial(F);
+
+    // get the decomposition of f in R
+    // Magma cant do that, so instead we get the roots in C and order them by complex conjugates, this yields the decomp in R
+    roots := [r[1] : r in Roots(PolynomialRing(ComplexField(50)) ! f)];
+    // group roots into orbits of Gal(C|R)
+    root_sets_local := IndexedSet({});
+    for rind in [1..#roots] do
+        c := Conjugate(roots[rind]);
+        for other_root_index in [1..#roots] do
+            if AbsoluteValue(c - roots[other_root_index]) lt 1E-15 then
+                Include(~root_sets_local, {rind, other_root_index});
+                continue rind;
+            end if;
+        end for;
+    end for;
+    // this is the same(!) grouping but in terms of global roots
+    root_sets := [[] : r in root_sets_local];
+
+    // find a root of f in Ehat completed at a place (i.E. a primitive element of the completion)
+    // Place in the decomposition is irrelevant, each yields an isomorphism
+    place_in_Ehat := Decomposition(Fhat, Infinity())[1][1];
+    if IsReal(place_in_Ehat) then
+        FhatP := RealField(50);
+    else
+        FhatP := ComplexField(50);
+    end if;
+    local_root := Roots(DefiningPolynomial(Fhat), FhatP)[1][1];
+
+    // the global roots
+    alphas := [el[1] : el in Roots(f, Fhat)];
+
+    for alpha in alphas do
+        // calculate iota_alpha
+        // get alpha in terms of the Basis {1, Ehat.1, Ehat.1^2, ...} of Ehat
+        coeffs := ElementToSequence(alpha);
+        // use the coefficients of alpha in terms of the Basis of Ehat to create an element of EhatP
+        iota_alpha := &+[coeffs[i] * local_root^(i - 1) : i in [1..Degree(Fhat, Rationals())]];
+
+        // go over each irreducible in the factorization of f over the relevant Q_p
+        // and check if iota_alpha is a zero of g
+        for root_set_loc_index in [1..#root_sets_local] do
+            for root_set_loc_element in root_sets_local[root_set_loc_index] do
+                // check if alpha is a zero of this factor
+                if AbsoluteValue(roots[root_set_loc_element] - iota_alpha) lt 1E-15 then
+                    Append(~root_sets[root_set_loc_index], alpha);
+                    continue alpha;
+                end if;
+            end for;
+        end for;
+    end for;
+
+    // create the corresponding local normcharacters in X_F
+    local_normcharacters_in_X_F := [X_F ! [(root in group) select 1 else 0 : root in alphas] : group in root_sets];
+
+    X_F_as_forgetful_vectorspace := VectorSpace(X_F);
+    T := sub<X_F_as_forgetful_vectorspace | [X_F_as_forgetful_vectorspace ! el : el in local_normcharacters_in_X_F]>;
+    // check if they intersect the relevant subrep and return the rank
+    return [Dimension(T meet sub<X_F_as_forgetful_vectorspace | [X_F_as_forgetful_vectorspace ! el : el in subrep]>) : subrep in irreds];
+end function;
+
+function local_ranks_at_infinite_place_ext(E, F, X_E, irreds, quotient_map, Ehat, Fhat)
+    // Calculate the local ranks of all irreds of the charactergroup of E for the Extension-Type
+    //
+    // INPUTS
+    //      FldNum E: F[sqrt(d)]
+    //      FldNum F: fixed field under the involution
+    //      ModTup X_E: Module giving the Gal(Ehat|Q) action on the characters of E^\times = R_E|Q(Gm)
+    //      List[List[ModTupElt]] irreds: irreducible subreps of X_E
+    //      Homomorphism quotient_map : X_E -> X(SU(E, sigma))xQ
+    //      FldNum Ehat: normal closure of E
+    //      FldNum Fhat: normal closure of F
+    // OUTPUTS
+    //      List[RngIntElt R Rank of Irred at this Index]
+
+    f := DefiningPolynomial(AbsoluteField(E));
+
+    // get the decomposition of f in R
+    // Magma cant do that, so instead we get the roots in C and order them by complex conjugates, this yields the decomp in R
+    roots := [r[1] : r in Roots(f, ComplexField(50))];
+    // group roots into orbits of Gal(C|R)
+    root_sets_local := IndexedSet({});
+    for rind in [1..#roots] do
+        c := Conjugate(roots[rind]);
+        for other_root_index in [1..#roots] do
+            if AbsoluteValue(c - roots[other_root_index]) lt 1E-15 then
+                Include(~root_sets_local, {rind, other_root_index});
+                continue rind;
+            end if;
+        end for;
+    end for;
+    // this will be the same(!) grouping but in terms of global roots
+    root_sets := [[] : r in root_sets_local];
+
+    // find a root of f in Ehat completed at a place (i.E. a primitive element of the completion)
+    // Place in the decomposition is irrelevant, each yields an isomorphism
+    place_in_Ehat := Decomposition(Ehat, Infinity())[1][1];
+    if IsReal(place_in_Ehat) then
+        EhatP := RealField(50);
+    else
+        EhatP := ComplexField(50);
+    end if;
+    local_root := Roots(DefiningPolynomial(Ehat), EhatP)[1][1];
+
+    // the global roots
+    alphas := [el[1] : el in Roots(f, Ehat)];
+
+    for alpha in alphas do
+        // calculate iota_alpha
+        // get alpha in terms of the Basis {1, Ehat.1, Ehat.1^2, ...} of Ehat
+        coeffs := ElementToSequence(alpha);
+        // use the coefficients of alpha in terms of the Basis of Ehat to create an element of EhatP
+        iota_alpha := &+[coeffs[i] * local_root^(i - 1) : i in [1..Degree(Ehat, Rationals())]];
+
+        // go over each irreducible in the factorization of f over the relevant Q_p
+        // and check if iota_alpha is a zero of g
+        for root_set_loc_index in [1..#root_sets_local] do
+            for root_set_loc_element in root_sets_local[root_set_loc_index] do
+                // check if alpha is a zero of this factor
+                if AbsoluteValue(roots[root_set_loc_element] - iota_alpha) lt 1E-15 then
+                    Append(~root_sets[root_set_loc_index], alpha);
+                    continue alpha;
+                end if;
+            end for;
+        end for;
+    end for;
+
+    // create the corresponding local normcharacters in X_E
+    local_normcharacters_in_X_E := [X_E ! [(root in el) select 1 else 0 : root in alphas] : el in root_sets];
+    // push them to X_S
+    local_normcharacters_in_X_S := [quotient_map(el) : el in local_normcharacters_in_X_E];
+    local_normcharacters_in_X_S := flatten_list(local_normcharacters_in_X_S);
+
+    X_S := Parent(local_normcharacters_in_X_S[1]);
+    X_S_as_forgetful_vectorspace := VectorSpace(X_S);
+    T := sub<X_S_as_forgetful_vectorspace | [X_S_as_forgetful_vectorspace ! el : el in local_normcharacters_in_X_S]>;
+    // check if they intersect the relevant subrep and return the rank
+    return [Dimension(T meet sub<X_S_as_forgetful_vectorspace | [X_S_as_forgetful_vectorspace ! el : el in subrep]>) : subrep in irreds];
+end function;
+
+function local_ranks_at_infinite_place(E, F, X_E, irreds, quotient_map, Ehat, Fhat)
+    // Call the correct local rank calculation at the infinite place
+    if Degree(E, Rationals()) eq Degree(F) then
+        // local rank for swap type and trivial type is the same (Tori are Q-isomorphic)
+        return local_ranks_at_infinite_place_swap(F, X_E, irreds, Fhat);
+    else
+        return local_ranks_at_infinite_place_ext(E, F, X_E, irreds, quotient_map, Ehat, Fhat);
+    end if;
+end function;
+
+function local_ranks_of_irreds(E, F, place_of_Q, X_E, irreds, quotient_map, Ehat, Fhat)
+    // Calculate rk_Q_p ( SU(E, sigma) ) for trivial, swap or extension-types (calles subfunctions)
+    //
+    // INPUTS
+    //      FldNum E: F[sqrt(d)] or F if d is square
+    //      FldNum F: fixed field under the involution
+    //      RngIntElt place_of_Q: prime to calculate rank at
+    //      ModTup X_E: Module giving the Gal(Ehat|Q) action on the characters of E^\times = R_E|Q(Gm)
+    //      List[List[ModTupElt]] irreds: irreducible subreps of X_E
+    //      Homomorphism quotient_map : X_E -> X(SU(E, sigma))xQ
+    // OUTPUTS
+    //      List[RngIntElt Q_p Rank of Irred at this Index]
+    if place_of_Q eq Infinity() then
+        return local_ranks_at_infinite_place(E, F, X_E, irreds, quotient_map, Ehat, Fhat);
+    else
+        return local_ranks_at_finite_place(E, F, place_of_Q, X_E, irreds, quotient_map, Ehat, Fhat);
+    end if;
+end function;
+
+function find_generator_irred_s_compact(subrep_nr, irreducible_subreps, E, F, d, X_E, quotient_map, Ehat, Fhat)
+    // Find a generating element of the Q-irreducible torus given by subrep_nr
+    //
+    // INPUTS
+    //  RngIntElt subrep_nr: the subrep in irreducible_subreps defining this torus (all other characters vanish)
+    //  List[List[ModTupElt]] irreducible_subreps: list of irreducible subreps given by a Q-Basis
+    //  FldNum E: NumberField F[sqrt(d)] if d is not square or F is d is square in F
+    //  FldNum F: Numberfield fixed under the involution
+    //  FldNumElt d \in F: If it is zero, defines F with trivial involution
+    //                     If it is nonzero square, defines F+F with the swap-involution 
+    //                     If it is not square, defines E:=F[sqrt(d)] with the involution sqrt(d) -> - sqrt(d)
+    // OUTPUTS
+    //  Q-Matrix generating the torus
+
+    p := 2;
+    while true do
+        if local_ranks_of_irreds(E, F, p, X_E, irreducible_subreps, quotient_map, Ehat, Fhat)[subrep_nr] gt 0 then
+            gen, all_gens := find_generator_irred(subrep_nr, irreducible_subreps, F, d, E, X_E, [*Infinity(), p*], Ehat, Fhat);
+            return gen, all_gens, p;
+        end if;
+        p := NextPrime(p);
+    end while;
+
+    // possible different solution (here we do not have to calculate rank exactly but throw away to many primes)
+    // calculate the number of roots that are part of irreducible_subreps[subrep_nr]
+    // find the first prime that has added nontrivial inertia smaller then N
+    // then the Torus definately has rank at this place
+end function;
+
+function create_subtorus_definers(all_irreds)
+    // Create all subtori given by lists defining their corresponding irreducible Reps in each numberfield
+    //
+    // INPUTS
+    //     list[list[list[list[gmodule_element]]]] all_irreds: [[irreds of numberfield 1 mult 1, irreds of numberfield 1 mult 2, ...],
+    //                                                          [irreds of numberfield 2 mult 1, ...], ...]
+    //         where `irreds of numberfield x mult j'==[irred_1, irred_2, ...]
+    //         where `irred_y'==[basis_element_1, basis_element_2, ...]
+    // OUTPUTS
+    //     CartesianProduct<CartesianProduct<CartesianProduct<[0, 1], ...>, ...>, ...> such that:
+    //         There is one outer factor for each numberfield, one intermediate factor for each multiple of this numberfield in the etale algebra,
+    //         In each outer Factor there is one inner factor for each Q-irreducible subtorus
+    //     e.g. the Element <<0, 1>, <1, 0, 1>> Is the subtorus given by the kernel of the second irreducible rep in the first numberfield
+    //     and the intersection of the kernels of the first and third irreducible representation in the second numberfield
+    Bins := [0, 1];
+
+    stacked_lists := [[[Bins : i in [1..#nf_subreps]] :
+                       nf_subreps in nf_mults] :
+                      nf_mults in all_irreds];
+
+    return CartesianProduct([CartesianProduct([CartesianProduct(nf_irred_flags)
+                                               : nf_irred_flags in nf_mults])
+                             : nf_mults in stacked_lists]);
+end function;
+
+function get_full_torus_definition(all_irreds)
+    // Define the entire torus
+    //
+    // INPUTS
+    //  List[List[irred]] all_irreds: all irreducible subreps of the entire torus
+    // OUTPUTS
+    //  The entire torus given in standard Notation [[0, 0, ...], ...]
+    return [[[0 : i in [1..#nf_subreps]] :
+             nf_subreps in nf_mults] :
+            nf_mults in all_irreds];
+end function;
+
+function restriction_of_C_form_to_R(q)
+    // Calculate the restriction of the C-Form q to a R-Form
+    //
+    // INPUTS
+    //  C-Matrix q: The C-Form
+    // OUTPUTS
+    //  R-Matrix q_res twice the size of q that defines the R-Form on the R-Basis {1, i} of C
+    // ASSUMPTIONS
+    //  The underlying involution is assumed to be the complex conjugation
+
+    n := NumberOfRows(q);
+    CC := ComplexField(40);
+    RR_basis_of_CC := [CC ! 1, CC.1];
+
+    q_res_coeffs := [];
+    // now calculate q(b, c) for b, c in the K-Basis of L^n
+    for i in [1..n], bind in [1..2] do
+        Append(~q_res_coeffs, []);
+        for j in [1..n], cind in [1..2] do
+            Append(~q_res_coeffs[(i - 1) * 2 + bind],
+                   Re(q[i][j] * Conjugate(RR_basis_of_CC[bind]) * RR_basis_of_CC[cind]));
+        end for;
+    end for;
+    return Matrix(RealField(40), q_res_coeffs);
+end function;
+
+function restriction_of_L_form_to_K(q, L, K)
+    // Calculate the restriction of the L-Form q to a K-Form
+    //
+    // INPUTS
+    //  L-Matrix q: The L-Form
+    //  FldNum L, K: L and the fixed field of K such that q is hermitian wrt to the unique nontrivial element of Gal(L|K)
+    // OUTPUTS
+    //  K-Matrix q_res twice the size of q that defines the K-Form on a K-Basis {1, a} of L such that a^2 \in K and a -> -a under the involution
+
+    n := NumberOfRows(q);
+    // we need L as an extension of K
+    M := RelativeField(K, L);
+    // find a such that L = K(a) and a^2 in K
+    // take the minimal polynomial (i.e. M.1^2 + x M.1 + y = 0) with x, y in K
+    // TODO WU [https://math.stackexchange.com/questions/2494309/field-extension-with-degree-2] defines this algorithm
+    coeffs := Coefficients(MinimalPolynomial(M.1, K));
+    alpha := M.1 + coeffs[2] / 2;
+    K_basis_of_M := [M ! 1, alpha];
+    // theta(alpha) := - alpha
+    theta_on_K_basis_of_M := [M ! 1, - alpha];
+
+    q_res_coeffs := [];
+    // now calculate q(b, c) for b, c in the K-Basis of L^n
+    for i in [1..n], bind in [1..2] do
+        Append(~q_res_coeffs, []);
+        for j in [1..n], cind in [1..2] do
+            Append(~q_res_coeffs[(i - 1) * 2 + bind],
+                   coordinates_in_basis_fld(
+                        q[i][j] * theta_on_K_basis_of_M[bind] * K_basis_of_M[cind],
+                        K_basis_of_M)[1]);
+        end for;
+    end for;
+    return Matrix(K, q_res_coeffs);
+end function;
+
+function check_hyperbolic(q, place_in_extension, disc, K)
+    // Check if q is hyperbolic at the relevant place
+    //
+    // INPUTS
+    //      Matrix q: The Quadratic form
+    //      finite place of K place_in_extension: the place to check
+    //      disc: discriminant of q
+    //      FldNum K: the field of which place_in_extension is a place
+    // OUTPUTS
+    //      BoolElt: true if the form is hyperbolic at the place, false otherwise
+
+    if not IsEven(NumberOfRows(q)) then
+        return false;
+    end if;
+
+    Kp, iota := Completion(K, place_in_extension);
+    if not IsSquare(iota(disc)) then
+        return false;
+    end if;
+
+    m := NumberOfRows(q)/2;
+    diag := Diagonalization(q);
+    hasse_invariant := &*[HilbertSymbol(K ! diag[i][i], K ! diag[j][j], Ideal(place_in_extension)) : i in [1..2*m], j in [1..2*m] | i lt j];
+    hilbert_symbol := HilbertSymbol(K ! -1, K ! -1, Ideal(place_in_extension))^(m * (m-1)/2);
+
+    return hasse_invariant eq hilbert_symbol;
+end function;
+
+
+function local_witt_index_K_place(q, P)
+    // for a symmetric form q over K calculate ind(qxK_P)
+    //
+    //  INPUTS
+    //      nxn K-matrix q : Form on K_P
+    //      PlcNumElt P
+    //  OUTPUTS
+    //      RngIntElt ind(q x K_P)
+
+    K := NumberField(P);
+    M := BaseRing(Parent(q));
+
+    dim_q := NumberOfRows(q);
+    quot, r := Quotrem(dim_q * (dim_q - 1), 4);
+    disc := ((r eq 0) select 1 else -1) * Determinant(q);
+
+    if IsInfinite(P) then
+        // infinite place correspond to Q-Embeddings into C
+        q_embed := Matrix([[Evaluate(q[i][j], P) : j in [1..dim_q]] : i in [1..dim_q]]);
+        if not IsReal(P) then
+            // for the properly complex places we need the restriction again
+            q_res := restriction_of_C_form_to_R(q_embed);
+            // Calculate the R-index of q
+            d := OrthogonalizeGram(q_res);
+            n_plus := #[j : j in [1..NumberOfRows(q)] | d[j][j] gt 0];
+            n_minus := #[j : j in [1..NumberOfRows(q)] | d[j][j] lt 0];
+            return Minimum(n_plus, n_minus) / 2;
+        end if;
+        // Calculate the R-index of q
+        d := OrthogonalizeGram(q_embed);
+        n_plus := #[j : j in [1..NumberOfRows(q)] | d[j][j] gt 0];
+        n_minus := #[j : j in [1..NumberOfRows(q)] | d[j][j] lt 0];
+        return Minimum(n_plus, n_minus);
+    end if;
+
+    // P is a finite place
+    KP, iota_KP := Completion(K, P);
+    if IsEven(dim_q) then
+        // printf "Index at place %o:\n", P_K_tup, "Minimal";
+        if check_hyperbolic(q, P, disc, K) then
+            // printf "Form is hyperbolic at this place. Index %o.\n", dim_q / 2, "Minimal";
+            return Floor(dim_q / 2);
+        end if;
+        // nota bene: IsSquare works without precision errors in pAdic fields
+        if IsSquare(iota_KP(disc)) then
+            // printf "Form is not hyperbolic, but discriminant is locally square. Index %o.\n", (dim_q - 4) / 2, "Minimal";
+            return Floor((dim_q - 4) / 2);
+        else
+            // printf "Form is not hyperbolic, discriminant is not locally square. Index %o.\n", (dim_q - 2) / 2, "Minimal";
+            return Floor((dim_q - 2) / 2);
+        end if;
+    else
+        // psi := phi \orth (-1)^(d*(d+1)/2) * det(phi))
+        psi := DiagonalJoin(q, Matrix(M, [[M ! disc * (-1)^dim_q]]));
+        disc_psi := Determinant(q)^2;
+        if check_hyperbolic(psi, P, disc_psi, K) then
+            return Floor((dim_q - 1) / 2);
+        else
+            return Floor((dim_q - 3) / 2);
+        end if;
+    end if;
+end function;
+
+function is_hermitian(q, L, K)
+    // Check if the q is hermitian
+    //
+    //  INPUTS
+    //      nxn L-Matrix q: the form
+    //      FldNum L: field of definition of q
+    //      FldNum K: fixed field of L under the involution
+    //  OUTPUTS
+    //      BoolElt (true if q is hermitian, false if q is skew-hermitian)
+
+    // get the involution on L
+    // TODO: something is not consistent here
+    // probably because we specifically chose the involution to map L.1 -> - L.1 or something like that
+    G, _, iota_G := AutomorphismGroup(L, K);
+    theta := iota_G(Random(Generators(G)));
+
+    for i in [1..NumberOfRows(q)] do
+        for j in [1..NumberOfRows(q)] do
+            if not q[i][j] eq 0 then
+                if theta(q[i][j]) eq q[j][i] then
+                    return true;
+                elif theta(q[i][j]) eq - q[j][i] then
+                    return false;
+                else
+                    print(L);
+                    print(K);
+                    print("Theta(L.1) = ");
+                    print(theta(L.1));
+                    printf "The Form %o is neither %o hermitian, nor skew-hermitian. Error.", q, theta, "Minimal";
+                    _ := ["See debug-output above", <1>];
+                end if;
+            end if;
+        end for;
+    end for;
+    printf "The Form %o is degenerate. Error.", q, "Minimal";
+    _ := ["Internal Error. See the output above.", <1>];
+end function;
+
+function local_witt_index_single_place_in_Q(q, p, L, K)
+    // Calculate sum_P|p ind(q x K_P)
+    //
+    //  INPUTS
+    //      nxn L-matrix q: the Form on L^n
+    //      Finite Prime or Infinity() p: the prime of Q
+    //      FldNum L: the field of Definition of q
+    //      FldNum K: the fixed field under the involution on L to which q is eps-hermitian
+    //  OUTPUTS
+    //      RngIntElt sum_P|p ind(q x K_P)
+
+    if Degree(L, Rationals()) eq Degree(K, Rationals()) then
+        // L = K
+        if IsSymmetric(q) then
+            // form is symmetric. Calculate its index locally
+            return &+[local_witt_index_K_place(q, P[1]) : P in Decomposition(K, p)];
+        end if;
+        // form is skew-symmetric. Its index is half the dimension
+        return NumberOfRows(q) / 2 * #Decomposition(K, p);
+    end if;
+
+    // print("In the extension type in local_witt_index_single_place_in_Q");
+    // [L:K] = 2
+    rank := 0;
+    for P_K_tup in Decomposition(K, p) do
+        decomp_in_L := [el[1] : el in Decomposition(AbsoluteField(L), p) | Extends(el[1], P_K_tup[1])];
+        if #decomp_in_L eq 1 then
+            // there is only a single place in L over P in K
+            // [L_P : K_P] = 2 and q x K_w is still properly eps-hermitian wrt the involution of L_P|K_P
+            if is_hermitian(q, L, K) then
+                q_res := restriction_of_L_form_to_K(q, L, K);
+                r := local_witt_index_K_place(q_res, P_K_tup[1]);
+                rank +:=  Floor(r / 2);
+                continue P_K_tup;
+            end if;
+            // Form is skew-hermitian. L.1 * q is hermitian and the indices are equal
+            q_herm := L.1 * q;
+            if ENABLE_SANITY_CHECKS and not is_hermitian(q_herm, L, K) then
+                print("Internal error. The following form is supposed to be hermitian, but isnt");
+                print(q_herm);
+                print("it is L.1  * q");
+                print(q);
+                _ := ["See debug-output above.", <1>];
+            end if;
+            q_res := restriction_of_L_form_to_K(q_herm, L, K);
+            r := local_witt_index_K_place(q_res, P_K_tup[1]);
+            if ENABLE_SANITY_CHECKS and not IsEven(r) then
+                print("Internal Error. We found a restricted form with uneven index. This should be impossible.");
+                _ := [1, <1>];
+            end if;
+            rank +:= Floor(r / 2);
+            continue P_K_tup;
+        end if;
+        // There are two places in L over K
+        rank +:= NumberOfRows(q) - 1;
+    end for;
+    // we were in the case [L:K] = 2 and went through the for loop.
+    return rank;
+end function;
+
+function local_witt_indices(q, set_of_places, L, K)
+    // for a hermitian or skew hermitian form q on L^n calculate sum_P|p ind(qxK_P) for the places p in set_of_places
+    //
+    //  INPUTS
+    //      nxn L-matrixq : Form on L^n
+    //      List[finite prime or Infinity()] set_of_places: Places to calculate the index at
+    //      FldNum L: base field of the form
+    //      FldNum K: the fixed field unter the involution to which q is eps-hermitian
+    //  OUTPUTS
+    //      AssociativeArray(prime : sum of indices)
+
+    ranks := AssociativeArray();
+    for p in set_of_places do
+        ranks[p] := local_witt_index_single_place_in_Q(q, p, L, K);
+    end for;
+    return ranks;
+end function;
+
+
+// TODO WU, dass das die richtigen Gleichungen sind und warum eine Lösung garantiert eindeutig existiert
+function calculate_form_of_involution(tau, q_basis_of_l, tau_on_q_basis_of_l, L)
+    // Calculate the hermitian form corresponding to the involution tau
+    // INPUTS
+    //      tau in terms of some basis of M_n(L)
+    // OUTPUTS
+    //      One of the hermitian forms corresponding to tau in terms of the same basis
+    list_of_equations_to_satisfy := [];
+    // dimension of the vectorspace
+    n := Floor(Root(#tau, 2));
+    // use all F of the form lambda * E_ij
+    for i in [1..n] do
+        for j in [1..n] do
+            // write out all the equations given by B * lambda * E_ij = tau(lambda) * tau(E_ij)^T * B
+            list_of_equations_to_satisfy cat:= [
+                [L ! ((j eq m and row eq k and col eq i) select (-1) else 0) +
+                 L ! ((col eq m) select &+[q_basis_of_l[l_basis_index] * tau[(row - 1) * n + k][(i - 1) * n + j][l_basis_index][1] : l_basis_index in [1..#q_basis_of_l]] else 0)
+                    : row in [1..n], col in [1..n]] :
+                k in [1..n], m in [1..n]
+            ];
+        end for;
+    end for;
+    m := Matrix(list_of_equations_to_satisfy);
+    // this kernel contains all matrices that correspond to the involution tau (such that x^T*B*F*y = x^T * tau(F)^T * B * y)
+    ker := Kernel(Transpose(m));
+    if ENABLE_SANITY_CHECKS and not Dimension(ker) eq 1 then
+        print("In calculate_form_of_involution: dim ker is not 1");
+        print(m);
+        print(tau);
+        print(q_basis_of_l);
+        print(tau_on_q_basis_of_l);
+        print(L);
+        print(ker);
+        _ := ["Internal error. See the output above.", <1>];
+    end if;
+
+    q_prescale := Matrix(L, n, n, Coordinates(VectorSpace(L, n^2), Basis(ker)[1]));
+
+    // q_prescale is a form that corresponds to tau
+    // however, we also require q_prescale to be hermitian or skew-hermitian, for which the following calculation is necessary
+    // This scaling is not necessary, when tau is of the first kind (since then every associated form is either symmetric or skew-symmetric)
+    second_kind := false;
+    for lindex in [1..#q_basis_of_l] do
+        if not q_basis_of_l[lindex] eq tau_on_q_basis_of_l[lindex] then
+            second_kind := true;
+            break lindex;
+        end if;
+    end for;
+
+    if not second_kind then
+        return q_prescale;
+    end if;
+
+    // This involution is of the second kind, so we need to rescale to be hermitian
+    // TODO WU, dass das die richtigen Gleichungen sind
+    list_of_scale_equations := [];
+    for i in [1..n] do
+        for j in [i+1..n] do
+            if q_prescale[i][j] eq 0 then
+                continue j;
+            end if;
+            // we now have an element of q which is not zero. It gives us an equation, x needs to satisfy
+            // this equation is x * q_prescale[i][j] = tau(x) * q_prescale[j][i]
+            Append(~list_of_scale_equations, [
+                (q_basis_of_l[lindex] * q_prescale[i][j] - tau_on_q_basis_of_l[lindex] *
+                 &+[tau_on_q_basis_of_l[linner] * coordinates_in_basis_fld(q_prescale[j][i], q_basis_of_l)[linner] :
+                    linner in [1..#q_basis_of_l]])
+                : lindex in [1..#q_basis_of_l]]);
+        end for;
+    end for;
+    // somethimes we do not actually need to rescale
+    if #list_of_scale_equations eq 0 then
+        return q_prescale;
+    end if;
+
+    rescale_matrix := Transpose(Matrix(list_of_scale_equations));
+    scale_ker := Kernel(rescale_matrix);
+    scale_factor := &+[q_basis_of_l[lindex] * Basis(scale_ker)[1][lindex] : lindex in [1..#q_basis_of_l]];
+    q := q_prescale * scale_factor;
+
+    // some tests validating the form
+    if ENABLE_SANITY_CHECKS then
+        for i in [1..n] do
+            for j in [1..n] do
+                // calculate q * E_ij
+                q_times_e_ij := q * SparseMatrix(L, n, n, [<i, j, 1>]);
+                // calculate theta(tau(e_ij))^T * q
+                // 1. calculate tau(e_ij)
+                tau_of_e_ij := Matrix(L, [[&+[q_basis_of_l[lind] * tau[(row - 1) * n + col][(i - 1) * n + j][lind][1] : lind in [1..#q_basis_of_l]] : col in [1..n]] : row in [1..n]]);
+                tau_of_e_ij_transpose := Transpose(tau_of_e_ij);
+                theta_on_tau_of_e_ij_transpose := Matrix(L, [[
+                    &+[tau_on_q_basis_of_l[lind] * coordinates_in_basis_fld(tau_of_e_ij_transpose[row][col], q_basis_of_l)[lind] : lind in [1..#q_basis_of_l]] : col in [1..n]] : row in [1..n]]);
+                if not q_times_e_ij eq theta_on_tau_of_e_ij_transpose * q then
+                    print(tau);
+                    print(q);
+                    print(q_times_e_ij);
+                    print(tau_of_e_ij_transpose);
+                    print(theta_on_tau_of_e_ij_transpose);
+                    print("inconsistent.");
+                    _ := ["Internal Error. See the output above.", <1>];
+                end if;
+            end for;
+        end for;
+    end if;
+    return q;
+end function;
+
+// TODO WU in chap:Implementation
+function find_primitive_element_with_canonical_involution(q_basis_of_l, tau_on_q_basis_of_l)
+    mu := [coordinates_in_basis_fld(tau_on_q_basis_of_l[i], q_basis_of_l) : i in [1..#q_basis_of_l]];
+    m := Matrix(Rationals(), [[((i eq j) select 1 else 0) + mu[j][i] : j in [1..#q_basis_of_l]] : i in [1..#q_basis_of_l]]);
+    res := Basis(Kernel(Transpose(m)))[1];
+    return &+[res[i] * q_basis_of_l[i] : i in [1..#q_basis_of_l]];
+end function;
+
+function fixed_field(L, q_basis_of_l, tau_on_q_basis_of_l)
+    // find tau as an element of Aut(L|Q)
+    auts_L_Q := Automorphisms(L);
+    for a in auts_L_Q do
+        for bind in [1..#q_basis_of_l] do
+            if not a(q_basis_of_l[bind]) eq tau_on_q_basis_of_l[bind] then
+                continue a;
+            end if;
+        end for;
+        // this is the correct aut.
+        return FixedField(L, [a]);
+    end for;
+end function;
+
+function ranks_of_simple_su(L, tau, set_of_places, q_basis_of_l)
+    // Calculates rk_P(M_r(L), tau) at each place where tau acts on M_r(L) via its action on M_n(Q)
+    // INPUTS
+    //      Numberfield L
+    //      Involution tau on M_n(Q) restricting to M_r(L) with its standard embedding
+    //      List[Prime or Infinity] set_of_places: set of places to calculate rank at
+    // OUTPUTS
+    //      List[rank_at_place_p] in same order as set_of_places
+    //      FldNum L: L
+    //      FldNum F: fixed field under the involution
+
+    // Compute tau as an involution on the individual L-Blocks
+    // Use the L-Basis consisting of one embedded in each block
+    // calculate the images in the Q-Basis given as the blowup of some Embedding L -> M_n(Q)
+    q_basis_of_embedded_l := [];
+    for b in q_basis_of_l do
+        left_reg_coords := [coordinates_in_basis_fld(b * c, q_basis_of_l) : c in q_basis_of_l];
+        Append(~q_basis_of_embedded_l, Transpose(Matrix(Rationals(), left_reg_coords)));
+    end for;
+
+    n := Floor(Root(NumberOfRows(tau), 2));
+    blocksize := Degree(L, Rationals());
+    num_of_blocks := Floor(n / blocksize);
+
+    // goal: calculate tau as an rxr-Matrix of [L:Q]-Transformation-Matrices
+    // we could technically do it as an rxr-Matrix of [L:K]-Transformations, but thats more programming work
+    tau_on_L_entries := [[ZeroMatrix(Rationals(), blocksize, blocksize) : col in [1..num_of_blocks^2]] : row in [1..num_of_blocks^2]];
+    for row in [1..num_of_blocks], col in [1..num_of_blocks], basis_index in [1..#q_basis_of_embedded_l] do
+        // the basis-element we want to calculate the image of
+        // Row number (row - 1) * num_of_blocks + col in the Row-vector wrt to the embedded basis of L-blocks
+        b := inject_as_block(q_basis_of_embedded_l[basis_index], row, col, n);
+        // calculate the image of b under tau
+        tau_b := eval_involution(tau, b);
+        // row_image and col_image give the position in the final matrix of the block-internal coordinates:
+        // (row_image - 1) * num_of_blocks + col_image
+        for row_image in [1..num_of_blocks], col_image in [1..num_of_blocks] do
+            // find the coefficients of this part of tau(b) in terms of q_basis_of_embedded_l
+            block_internal_coords := coordinates_in_basis(
+                Submatrix(tau_b,
+                          (row_image - 1) * blocksize + 1,
+                          (col_image - 1) * blocksize + 1,
+                          blocksize, blocksize),
+                q_basis_of_embedded_l);
+            // write this info as a transformation-matrix [L:Q]^2 into the correct entry in tau_on_L_entries
+            for block_internal_row_index in [1..blocksize] do
+                tau_on_L_entries
+                    [(row_image - 1) * num_of_blocks + col_image]
+                    [(row - 1) * num_of_blocks + col]
+                    [block_internal_row_index]
+                    [basis_index] := block_internal_coords[block_internal_row_index];
+            end for;
+        end for;
+    end for;
+
+    // add sanity checks for tau_on_L_entries
+    // check that tau(l E_ij) is correct for all l and E_ij
+    for i in [1..num_of_blocks] do
+        for j in [1..num_of_blocks] do
+            // check if tau is an involution (ie squares to the identity)
+            tau_squared_ij := &+[tau_on_L_entries[i][k] * tau_on_L_entries[k][j] : k in [1..#tau_on_L_entries]];
+            if i eq j and not tau_squared_ij eq IdentityMatrix(Rationals(), #q_basis_of_l) or (not i eq j) and not tau_squared_ij eq ZeroMatrix(Rationals(), #q_basis_of_l) then
+                print(tau_on_L_entries);
+                print(<i, j, tau_squared_ij>);
+                _ := ["Internal Error. See the output above.", <1>];
+            end if;
+            for lindex in [1..#q_basis_of_l] do
+                b := inject_as_block(q_basis_of_embedded_l[lindex], i, j, n);
+                tau_on_b := eval_involution(tau, b);
+                tau_on_L_entries_on_b_pre_embed := Matrix(L, [[&+[q_basis_of_l[lind] * tau_on_L_entries[(row - 1) * num_of_blocks + col][(i - 1) * num_of_blocks + j][lind][lindex] : lind in [1..#q_basis_of_l]] : col in [1..num_of_blocks]] : row in [1..num_of_blocks]]);
+                tau_on_L_entries_on_b := [[
+                    &+[q_basis_of_embedded_l[bindex] *
+                       coordinates_in_basis_fld(tau_on_L_entries_on_b_pre_embed[row][col], q_basis_of_l)[bindex] : bindex in [1..#q_basis_of_l]] : col in [1..num_of_blocks]]: row in [1..num_of_blocks]];
+                tau_on_L_entries_on_b := BlockMatrix(tau_on_L_entries_on_b);
+                if not tau_on_L_entries_on_b eq tau_on_b then
+                    print("inconsistent tau");
+                    _ := ["Internal Error. See output above."];
+                end if;
+            end for;
+        end for;
+    end for;
+
+    // calculate the action of tau on the central basis of l
+    q_basis_of_central_l := [&+[inject_as_block(b, i, i, n) : i in [1..num_of_blocks]] : b in q_basis_of_embedded_l];
+    tau_on_q_basis_of_l := [coordinates_in_basis(eval_involution(tau, b), q_basis_of_central_l) : b in q_basis_of_central_l];
+    tau_on_q_basis_of_l := [&+[q_basis_of_l[i] * tup[i] : i in [1..blocksize]] : tup in tau_on_q_basis_of_l];
+
+
+    // get the fixed field in L under tau
+    F := fixed_field(L, q_basis_of_l, tau_on_q_basis_of_l);
+
+    // MAGMA is weird
+    if Degree(F, Rationals()) eq 1 then
+        F := RationalsAsNumberField();
+        tmp := IsSubfield(F, L);
+    end if;
+
+    // When the involution is nontrivial, redefine L to M such that M.1 -> - M.1 under the involution (makes things easier later)
+    if not Degree(L, Rationals()) eq Degree(F, Rationals()) then
+        alpha := find_primitive_element_with_canonical_involution(q_basis_of_l, tau_on_q_basis_of_l);
+        // MAGMA is weird
+        if Degree(F, Rationals()) eq 1 then
+            mp := MinimalPolynomial(alpha);
+        else
+            mp := MinimalPolynomial(alpha, F);
+        end if;
+        M := ext<F | mp>;
+        _ := IsIsomorphic(M, L);
+        _ := IsSubfield(F, M);
+        q_basis_of_m := [M ! el : el in q_basis_of_l];
+        tau_on_q_basis_of_m := [M ! el : el in tau_on_q_basis_of_l];
+        tau_on_M_entries := [[Matrix(M, mat): mat in row]: row in tau_on_L_entries];
+
+        q := calculate_form_of_involution(tau_on_M_entries, q_basis_of_m, tau_on_q_basis_of_m, M);
+
+        return local_witt_indices(q, set_of_places, M, F), L, F;
+    end if;
+
+    q := calculate_form_of_involution(tau_on_L_entries, q_basis_of_l, tau_on_q_basis_of_l, L);
+    return local_witt_indices(q, set_of_places, L, F), L, F;
+end function;
+
+function ranks_of_centraliser_summand(K_realized, E_realized, set_of_places, ds_on_E, b_on_E)
+    // Calculate the ranks of a single summand of the centraliser
+    //
+    // INPUTS
+    //  Q-Matrix-Algebra K_realized: the summand of the centraliser to calculate rank at
+    //  List[Tuple<FldNum, RngIntElt>] E_realized: Etale Algebra E this K_realized injects into
+    //  List[finite Prime or Infinity()] set_of_places: places to calculate rank at
+    //  List[List[FldNumElt defining the extension F+F or F[sqrt(d)]]] ds_on_E: ds defining the extension
+    //  List[List[List[FldNumElt, FldNumElt] in swap-type or FldNumElt in trivial or extension-typ]] b_on_E: bs defining the twist in the traceform
+    // OUTPUTS
+    //  The ranks of the summand
+    //  The field K, K_realized is isomorphic to
+    //  The fixed field F under the involution on K_realized
+
+    K := QNF();
+    for gen in Generators(K_realized) do
+        for f in Factorization(MinimalPolynomial(gen)) do
+            K := CompositeFields(K, NumberField(f[1]))[1];
+        end for;
+    end for;
+    K := OptimizedRepresentation(K);
+
+    // get the involution
+    M, tau, q_basis_of_k := calculate_full_involution(E_realized, K, ds_on_E, b_on_E);
+    // and calculate the ranks of the simple SU
+    return ranks_of_simple_su(K, tau, set_of_places, q_basis_of_k);
+end function;
+
+function calculate_central_idempotents(fixed_etale_algebra, ds)
+    // Calculate a complete list of minimal central idempotents of fixed_etale_algebra[sqrt(ds)]
+    //
+    // INPUTS
+    //  List[Tuple<FldNum, RngIntElt>] fixed_etale_algebra : the etale-algebra fixed under the involution
+    //  List[FldNumElt] ds : the elements defining the extension and the involution
+    // OUTPUTS
+    //  List[Matrix] : list of minimal central idempotents
+
+    // Let E := fixed_etale_algebra[sqrt(ds)]
+    // Write out the central idempotents of each subalg of E
+    // nota bene: This is effectively Wedderburn.
+    // Since we know that E comes from fixed_etale_algebra, writing the idempotents by hand is computationally
+    // cheaper then simply DirectSumDecomposition(E)[2], though more lines of code
+    central_idempotents := [];
+    // The list of dimensions of all the fields in E
+    ns := [];
+    for field_nr in [1..#fixed_etale_algebra] do
+        Append(~ns, []);
+        for mult_index in [1..fixed_etale_algebra[field_nr][2]] do
+            Append(~ns[field_nr], []);
+            if ds[field_nr][mult_index] eq 0 then
+                // TRIVIAL-TYPE
+                ns[field_nr][mult_index] := [Degree(fixed_etale_algebra[field_nr][1], Rationals())];
+            elif IsSquare(ds[field_nr][mult_index]) then
+                // SWAP-TYPE
+                ns[field_nr][mult_index] := [Degree(fixed_etale_algebra[field_nr][1], Rationals()),
+                                             Degree(fixed_etale_algebra[field_nr][1], Rationals())];
+            else
+                // EXTENSION-TYPE
+                ns[field_nr][mult_index] := [2 * Degree(fixed_etale_algebra[field_nr][1], Rationals())];
+            end if;
+        end for;
+    end for;
+    prefix_zeros := 0;
+    postfix_zeros := &+[&+[&+sub : sub in el] :el in ns];
+
+    for field_nr in [1..#fixed_etale_algebra] do
+        Append(~central_idempotents, []);
+        for mult_index in [1..fixed_etale_algebra[field_nr][2]] do
+            Append(~central_idempotents[field_nr], []);
+            central_idempotents[field_nr][mult_index] := [];
+            for swap_index in [1..#ns[field_nr][mult_index]] do
+                dimension := ns[field_nr][mult_index][swap_index];
+                postfix_zeros := postfix_zeros - dimension;
+                if prefix_zeros eq 0 then
+                    if postfix_zeros eq 0 then
+                        Append(~central_idempotents[field_nr][mult_index], IdentityMatrix(Rationals(), dimension));
+                    else
+                        Append(~central_idempotents[field_nr][mult_index], DiagonalJoin(
+                            <IdentityMatrix(Rationals(), dimension),
+                             DiagonalMatrix([Rationals() | 0 : el in [1..postfix_zeros]])>));
+                    end if;
+                else
+                    if postfix_zeros eq 0 then
+                        Append(~central_idempotents[field_nr][mult_index], DiagonalJoin(
+                                <DiagonalMatrix([Rationals() | 0 : el in [1..prefix_zeros]]),
+                                 IdentityMatrix(Rationals(), dimension)>));
+                    else
+                        Append(~central_idempotents[field_nr][mult_index], DiagonalJoin(
+                            <DiagonalMatrix([Rationals() | 0 : el in [1..prefix_zeros]]),
+                             IdentityMatrix(Rationals(), dimension),
+                             DiagonalMatrix([Rationals() | 0 : el in [1..postfix_zeros]])>));
+                    end if;
+                end if;
+                prefix_zeros := prefix_zeros + dimension;
+            end for;
+        end for;
+    end for;
+    return central_idempotents;
+end function;
+
+// TODO WU, dass diese injectionen alle existieren und das jedes K entweder reiner swap oder invarianter gemischter typ ist
+function find_single_injection_data(K_realized, central_idempotents)
+    // Find the parts of fixed_etale_algebra that K_realized injects into
+    //
+    // INPUTS
+    //      Q-Matrix-Algebra K_realized: the summand whose injection we want to find
+    //      List[Q-Matrix Idempotents] central_idempotents: idempotents defining the blocks into which we need to test injection
+    // OUTPUTS
+    //      List[Tuple<RngIntElt field_nr, RngIntElt field_mult_nr, RngIntElt swap_index>] : the list of all summands of fixed_etale_algebra K_realized injects into
+
+    // For each subfield in fixed_etale_algebra we can now check wether e * K * e = 0 or not (which tells us whether K injects or not)
+    injection_data := [];
+    total_dimension := NumberOfRows(central_idempotents[1][1][1]);
+
+    for field_nr in [1..#central_idempotents] do
+        for mult_index in [1..#central_idempotents[field_nr]] do
+            for swap_index in [1..#central_idempotents[field_nr][mult_index]] do
+                projection := [central_idempotents[field_nr][mult_index][swap_index] * b * central_idempotents[field_nr][mult_index][swap_index] :
+                               b in Basis(K_realized)];
+                if not Dimension(MatrixAlgebra<Rationals(), total_dimension | projection>) eq 0 then
+                    // we have an injection, add it to injection_data
+                    Append(~injection_data, <field_nr, mult_index, swap_index>);
+                end if;
+            end for;
+        end for;
+    end for;
+    return injection_data;
+end function;
+
+function ranks_of_centraliser_of_noninjected(tau, set_of_places, noninjected_blocks, fixed_etale_algebra, ds)
+    // TODO DOCU
+
+    // short circuit if no block is noninjected:
+    for field_sublist in noninjected_blocks do
+        if #field_sublist eq 0 then
+            indices := AssociativeArray();
+            for P in set_of_places do indices[P] := 0; end for;
+            return indices;
+        else
+            break field_sublist;
+        end if;
+    end for;
+    // calculate the part of tau that acts on the M_n(Q) acting on the noninjected_blocks
+    ns := [<Degree(F[1], Rationals()), F[2]> : F in fixed_etale_algebra];
+    // the total dimension of the ambient space
+    n := &+[&+[<Degree(fixed_etale_algebra[field_nr][1], Rationals()), i> * (ds[field_nr][i] eq 0) select 1 else 2
+            : i in [1..fixed_etale_algebra[field_nr][2]]] : field_nr in [1..#fixed_etale_algebra]];
+    // the indices of the basis vectors belonging to the noninjected blocks
+    restricted_basis_vector_indices := [];
+    offset := 0;
+    for field_nr in [1..#fixed_etale_algebra] do
+        for mult_index in [1..fixed_etale_algebra[field_nr][2]] do
+            // SWAP-Type
+            if ds[field_nr][mult_index] eq 0 then
+                if <mult_index, 1> in noninjected_blocks[field_nr] then
+                    Append(~restricted_basis_vector_indices, [offset + i : i in [1..ns[field_nr][1]]]);
+                end if;
+                // one more block was iterated over. offset all future indices by its length
+                offset := offset + ns[field_nr][1];
+            elif IsSquare(ds[field_nr][mult_index]) then
+                for swap_index in [1..2] do
+                    if <mult_index, swap_index> in noninjected_blocks[field_nr] then
+                        Append(~restricted_basis_vector_indices, [offset + i : i in [1..ns[field_nr][1]]]);
+                    end if;
+                    // one more block was iterated over. offset all future indices by its length
+                    offset := offset + ns[field_nr][1];
+                end for;
+            // EXTENSION-Type
+            else
+                if <mult_index, 1> in noninjected_blocks[field_nr] then
+                    Append(~restricted_basis_vector_indices, [offset + i : i in [1..2*ns[field_nr][1]]]);
+                end if;
+                // one more block was iterated over. offset all future indices by its length (double because of square extension type)
+                offset := offset + 2 * ns[field_nr][1];
+            end if;
+        end for;
+    end for;
+
+    // blowup the linear coordinates into the 
+    M := MatrixAlgebra(Rationals(), n);
+    // tau_restricted is given by the components of tau that have something to do with the basis vectors with the restricted indices
+    // since tau restricts properly, we only need to copy all the relevant entries that act on the basis vectors with restricted indices
+    // the relevant basis elements are E_ij where i and j are both in restricted_basis_vector_indices
+    // tau is n^2xn^2 so we need to transform these indices  (into their position in the Basis {E_11, E_12, ..., E_nn} of M_n(Q))
+    tau_restricted := Matrix(Rationals(),
+                             [[Coordinates(M, tau)[(i - 1) * n + j] :
+                               j in restricted_basis_vector_indices]:
+                              i in restricted_basis_vector_indices]);
+    // calculate rank of simple SU like in the injected case
+    return ranks_of_simple_su(RationalsAsNumberField(), tau_restricted, set_of_places)[1];
+end function;
+
+
+function ranks_of_centraliser(alg_of_max_torus, alg_of_subtorus, tau, set_of_places, fixed_etale_algebra, ds, b)
+    // Calculate the Local Ranks of the Centraliser of alg_of_subtorus
+    //
+    // INPUTS
+    //      Matrix-Algebra over Q alg_of_max_torus: The complete algebra of the maximal Torus
+    //      Matrix-Algebra over Q alg_of_subtorus: The algebra generated by the subtorus
+    //      Matrix tau: The Involution on M_n(Q) given as an n^2xn^2-Matrix in the standard-basis
+    //      List[Prime or Infinity()]: Set of Places we need the local Ranks at
+    //      Matrix-Algebra over Q fixed_etale_algebra: the subalgebra of alg_of_max_torus fixed by tau (makes computation much simpler)
+    //      List[List[FieldElement]] ds: The list of d defining the extension alg_of_max_torus | fixed_etale_algebra
+    //      List[List[FieldElement]] b: The list of b defining the twist of the trace-form giving tau
+    // OUTPUTS
+    //      AssociativeArray[RngIntElt or Infinity()] -> RngIntElt: The ranks at each place
+    ranks := AssociativeArray();
+    for P in set_of_places do
+        ranks[P] := 0;
+    end for;
+    // decompose the subalgebra
+    sub_decomp := DirectSumDecomposition(alg_of_subtorus);
+    
+    // the blocks of E a subfield was injected into
+    injected_blocks := [[] : field_nr in [1..#fixed_etale_algebra]];
+    // the Ks in sub_decomp which swap with another K, together with their injection_data
+    swap_type_Ks := [];
+    field_pairs_for_central_torus := [**];
+    // for output only: the part of the centraliser tau restricts to each simple summand of
+    restrict_type := [**];
+    // the part of the centraliser tau swaps simple summands of
+    swap_type := [**];
+
+    for K_index in [1..#sub_decomp] do
+        K_realized := sub_decomp[K_index];
+        // find the blocks in the full algebra K injects into (generate injection-data)
+        central_idempotents := calculate_central_idempotents(fixed_etale_algebra, ds);
+        injection_data := find_single_injection_data(K_realized, central_idempotents);
+        // check if K only injects into halfs of swap-types
+        swap_injections := [el : el in injection_data | not ds[el[1]][el[2]] eq 0 and IsSquare(ds[el[1]][el[2]])];
+
+        for si in swap_injections do
+            // there is an F where K injects into the first and not the second copy (or reverse)
+            // so K is of swap-type. Continue for now (swap-types will be calculated in a loop later)
+            if (si[3] eq 1) and (not <si[1], si[2], 2> in injection_data) or (si[3] eq 2) and (not <si[1], si[2], 1> in injection_data) then
+                Append(~swap_type_Ks, <K_realized, injection_data>);
+                continue K_index;
+            end if;
+        end for;
+
+        // calculate the ranks of this K which tau restricts on
+        individual_ranks, K, F := ranks_of_centraliser_summand(
+            K_realized,
+            [<fixed_etale_algebra[field_nr][1], #[i : i in [1..fixed_etale_algebra[field_nr][2]] | <field_nr, i, 1> in injection_data]> :
+             field_nr in [1..#fixed_etale_algebra]],
+            set_of_places,
+            [*[*ds[i][j] : j in [1..#ds[i]]  | <i, j, 1> in injection_data*] : i in [1..#ds]*],
+            [*[*b[i][j] : j in [1..#b[i]]  | <i, j, 1> in injection_data*] : i in [1..#b]*]);
+        Append(~field_pairs_for_central_torus, <K, F>);
+        Append(~restrict_type, <
+            K,
+            &+[Integers() | Floor(2 * Degree(fixed_etale_algebra[field_nr][1], Rationals()) / Degree(K)) * #[i
+                    : i in [1..fixed_etale_algebra[field_nr][2]]
+                    | <field_nr, i, 1> in injection_data]
+               : field_nr in [1..#fixed_etale_algebra]]>);
+
+        for P in set_of_places do
+            ranks[P] := ranks[P] + individual_ranks[P];
+        end for;
+        // collect all the blocks of E which K injected into
+        for field_nr in [1..#fixed_etale_algebra] do
+            injected_blocks[field_nr] cat:= [<i, j> :
+                                             i in [1..fixed_etale_algebra[field_nr][2]], j in [1, 2] |
+                                             <field_nr, i, j> in injection_data];
+        end for;
+    end for;
+    // printf "ranks of injected blocks: %o\n", [ranks[P] : P in set_of_places], "Minimal";
+
+    // the indices of Ks in swap_type_Ks that are the second half of one pairing
+    // we have to ignore them. SU(K1+K2, swap) ~= GL_n(K) for some n, which we only need to calculate for one of them
+    ignore_Ks := [Integers() | ];
+    for K_index in [1..#swap_type_Ks] do
+        // collect all the blocks of E which K injected into
+        // we have to do this before skipping Ks in the next loop
+        for field_nr in [1..#fixed_etale_algebra] do
+            injected_blocks[field_nr] cat:= [<i, j> :
+                                             i in [1..fixed_etale_algebra[field_nr][2]], j in [1, 2] |
+                                             <field_nr, i, j> in swap_type_Ks[K_index][2]];
+        end for;
+
+        // skip Ks we want to ignore
+        if K_index in ignore_Ks then
+            continue K_index;
+        end if;
+
+        // find the other K that injects in the same swap_types
+        for compare_index in [1..#swap_type_Ks] do
+            if [<el[1], el[2]> : el in swap_type_Ks[K_index][2]] eq [<el[1], el[2]> : el in swap_type_Ks[compare_index][2]] then
+                // remove this other field from swap_type_Ks (we only need to use one of the two Ks swapped)
+                Append(~ignore_Ks, compare_index);
+            end if;
+        end for;
+        K := QNF();
+        for gen in Basis(swap_type_Ks[K_index][1]) do
+            for f in Factorization(MinimalPolynomial(gen)) do
+                K := CompositeFields(K, NumberField(f[1]))[1];
+            end for;
+        end for;
+        K := OptimizedRepresentation(K);
+
+        // The dimension of the GL_n(K) we need the rank of
+        dimension := Floor(&+[Degree(fixed_etale_algebra[tup[1]][1], Rationals()) / Degree(K, Rationals()) :
+                              tup in swap_type_Ks[K_index][2]]);
+
+        Append(~swap_type, <K, dimension>);
+
+        for P in set_of_places do
+            // printf "Swap summand with rank at place %o = %o.\n", P, #Decomposition(K, P) * dimension;
+            ranks[P] := ranks[P] + #Decomposition(K, P) * dimension;
+        end for;
+    end for;
+
+    // we also need to calculate the ranks of all the parts of alg_of_max_torus that have no K injected (the centraliser is the common M_n(Q))
+    // get all the fields in fixed_etale_algebra no K injected into
+    noninjected_blocks := [[<i, j> :
+                       i in [1..fixed_etale_algebra[field_nr][2]], j in [1, 2] |
+                       not <i, j> in injected_blocks[field_nr]
+                       and (not j eq 2 or (not ds[field_nr][i] eq 0 and IsSquare(ds[field_nr][i])))] : field_nr in [1..#fixed_etale_algebra]];
+    // calculate the ranks
+    noninjected_ranks := ranks_of_centraliser_of_noninjected(tau, set_of_places, noninjected_blocks, fixed_etale_algebra, ds);
+    Append(~restrict_type, <Rationals(), &+[
+        &+[Integers() | Degree(fixed_etale_algebra[field_nr][1]) :
+           i in [1..fixed_etale_algebra[field_nr][2]], j in [1, 2] |
+           not <i, j> in injected_blocks[field_nr]
+           and (not j eq 2 or (not ds[field_nr][i] eq 0 and IsSquare(ds[field_nr][i])))] : field_nr in [1..#fixed_etale_algebra]]>);
+
+    // printf "\nRanks of noninjected_blocks: %o.\n", [noninjected_ranks[P] : P in set_of_places], "Minimal";
+    for P in set_of_places do
+        ranks[P] := ranks[P] + noninjected_ranks[P];
+    end for;
+
+    // we also need to calculate the rank of the central torus
+    // for each injection, we have calculated the fixed field of the involution
+    // then add the number of primes over p for each fixed field - 1: this is the rank of the central torus
+    for p in set_of_places do
+        rank_of_central_torus := 0;
+        for ABtup in field_pairs_for_central_torus do
+            // A | B is a numberfieldextension, B is the fixed field under the involution
+            A := ABtup[1];
+            B := ABtup[2];
+            // The correct rank is the number of primes in B over p that split in A
+            rank_of_central_torus +:= &+[
+                (#[P_A[1] : P_A in Decomposition(A, p) | Extends(P_A[1], P_B[1])] gt 1)
+                select 1
+                else 0 : P_B in Decomposition(B, p)];
+        end for;
+        // printf "Central Torus has rank %o at place %o\n", rank_of_central_torus, p, "Minimal";
+        ranks[p] := ranks[p] + rank_of_central_torus;
+    end for;
+    return ranks, restrict_type, swap_type;
+end function;
+
+// TODO WU
+//  - ganzes Verfahren in dieser Funktion durchschauen, vielleicht ist was relevantes dabei
+//  - warum finden wir bis auf konjugation alle S-amplen subtori auf die Art?
+function find_S_ample_subtori(fixed_etale_algebra, ds, b, set_of_places)
+    // Find all S-ample subtori of fixed_etale_algebra[sqrt(ds)] with the twisted traceform given by b
+    //
+    // INPUTS
+    //      List[Tuple<FldNum, RngInt>] fixed_etale_algebra: the fixed etale algebra
+    //      List[List[FldNumElt]]: the element ds defining E := fixed_etale_algebra[sqrt(ds)]
+    //      List[List[List[FldNumElt, FldNumElt] if d is square at this index or FldNumElt if d is not square]] b: the element of E defining the twist of the traceform used for injection
+    //      List[finite Prime or Infinity()] set_of_places: the set of primes S
+    // OUTPUTS
+    //      List[all subtori that are S-ample]
+    //      String: The output
+
+    output := "";
+    // rank_datum for all Q-irreducible subtori
+    all_irreds := [];
+    all_rank_datum := [];
+
+    field_nr := 0;
+    // generators for all irreducible tori
+    gens := [**];
+    // a generating set of the integral points for each irreducible torus
+    all_generators := [**];
+    // The primes used for generator calculation or 0 if only set_of_places was used
+    used_primes := [**];
+    all_irreds_datum := [];
+
+    for F_mult in fixed_etale_algebra do
+        field_nr := field_nr + 1;
+        F := F_mult[1];
+
+        if VERBOSITY ge 3 and Degree(F) ge 3 then
+            printf "\n>>I am now calculating the normal closure of %o. This might take a while...", F;
+        end if;
+        Fhat := NormalClosure(F);
+        Fhat := OptimizedRepresentation(Fhat);
+        if VERBOSITY ge 3 and Degree(F) ge 3 then
+            printf "Done.\n";
+        end if;
+        _ := IsSubfield(F, Fhat);
+
+        mult := F_mult[2];
+        Append(~gens, [**]);
+        Append(~all_generators, [**]);
+        Append(~used_primes, [**]);
+        Append(~all_rank_datum, []);
+        Append(~all_irreds, []);
+        Append(~all_irreds_datum, []);
+
+        for i in [1..mult] do
+            if not IsSquare(ds[field_nr][i]) then
+                R<x> := PolynomialRing(F);
+                E := ext<F | x^2 - ds[field_nr][i]>;
+                if VERBOSITY ge 3 and Degree(E, Rationals()) ge 3 then
+                    printf "\n>>I am now calculating the normal closure of %o. This might take a while...", AbsoluteField(E);
+                end if;
+                Ehat := NormalClosure(AbsoluteField(E));
+                Ehat := OptimizedRepresentation(Ehat);
+                if VERBOSITY ge 3 and Degree(E, Rationals()) ge 3 then
+                    printf "Done.\n";
+                end if;
+                _ := IsSubfield(E, Ehat);
+            else
+                E := F;
+                // Ehat is not used while computing the galois rep in this case
+                Ehat := Fhat;
+            end if;
+
+            // calculate the relevant Gal(bar Q|Q)-Module
+            X_E, X_S, quotient_map, G := galois_representation_w_involution(F, ds[field_nr][i], E, Ehat, Fhat);
+
+            if Dimension(X_S) eq 0 then
+                print("Charactergroup is trivial here:");
+                print(X_E);
+                print(X_S);
+                print(E);
+                print(quotient_map);
+                print(F);
+                print(ds[field_nr][i]);
+                _ := ["See the debug output above", <1>];
+            end if;
+
+            // calculate irreducible subrepresentations
+            irreducible_subreps := Decomposition(X_S);
+            irreducible_subreps := [*[X_S ! el : el in Basis(irred)]: irred in irreducible_subreps*];
+            // Make the bases integer (so that we can take the powers of matrices by these coefficients later)
+            for subrep_index in [1..#irreducible_subreps] do
+                for character_index in [1..#irreducible_subreps[subrep_index]] do
+                    least_common_multiple := LeastCommonMultiple(
+                        [Denominator(el) :
+                         el in ElementToSequence(irreducible_subreps[subrep_index][character_index])]);
+                    irreducible_subreps[subrep_index][character_index] := irreducible_subreps[subrep_index][character_index] * least_common_multiple;
+                end for;
+            end for;
+            Append(~all_irreds[field_nr], irreducible_subreps);
+            Append(~all_rank_datum[field_nr], []);
+
+            // calculate the ranks of the irreducible subtori
+            for subrep_nr := 1 to #irreducible_subreps do
+                Append(~all_rank_datum[field_nr][i], AssociativeArray());
+                // different for Swap-Type Tori: check if N_F|Q is in the subrep (this is the only Gal-invariant Character up to multiplicity)
+                if Degree(E, Rationals()) eq Degree(F, Rationals()) then
+                    all_rank_datum[field_nr][i][subrep_nr][0] := (X_E ! [1 : i in [1..Degree(F)]] in irreducible_subreps[subrep_nr]) select 1 else 0;
+                else
+                    all_rank_datum[field_nr][i][subrep_nr][0] := 0;
+                end if;
+            end for;
+            // local ranks
+            for place in set_of_places do
+                local_ranks := local_ranks_of_irreds(E, F, place, X_E, irreducible_subreps, quotient_map, Ehat, Fhat);
+                for subrep_nr in [1..#irreducible_subreps] do
+                    all_rank_datum[field_nr][i][subrep_nr][place] := local_ranks[subrep_nr];
+                end for;
+            end for;
+            Append(~gens[field_nr], [**]);
+            Append(~all_generators[field_nr], [**]);
+            Append(~used_primes[field_nr], [**]);
+            for subrep_nr in [1..#irreducible_subreps] do
+                // calculate a generator for all irreducible subtori of F that are S-compact
+                if &+[all_rank_datum[field_nr][i][subrep_nr][place] : place in set_of_places] eq 0 then
+                    generator_of_subtorus, all_gens, used_prime := find_generator_irred_s_compact(
+                        subrep_nr,
+                        irreducible_subreps,
+                        E,
+                        F,
+                        ds[field_nr][i],
+                        X_E,
+                        quotient_map,
+                        Ehat,
+                        Fhat);
+                    Append(~gens[field_nr][i], generator_of_subtorus);
+                    Append(~all_generators[field_nr][i], all_gens);
+                    Append(~used_primes[field_nr][i], used_prime);
+                    continue subrep_nr;
+                end if;
+                set_of_places_where_subrep_is_not_compact := [p : p in set_of_places | all_rank_datum[field_nr][i][subrep_nr][p] gt 0];
+                // calculate a generator for all irreducible subtori of F that are not S-compact
+                generator_of_subtorus, all_gens := find_generator_irred(
+                    subrep_nr, irreducible_subreps,
+                    F, ds[field_nr][i], E,
+                    X_E,
+                    set_of_places_where_subrep_is_not_compact,
+                    Ehat, Fhat);
+                // Coerce into a rational matrix (its entries are rational, as guaranteed by the algorithm in find_generator)
+                generator_of_subtorus := Matrix(Rationals(), generator_of_subtorus);
+                Append(~gens[field_nr][i], generator_of_subtorus);
+                Append(~all_generators[field_nr][i], all_gens);
+                Append(~used_primes[field_nr][i], 0);
+            end for;
+        end for;
+    end for;
+
+    // Verbose-output irreducible subtori with generators and ranks
+    if VERBOSITY ge 1 then
+        for field_nr in [1..#fixed_etale_algebra] do
+            for mult_index in [1..fixed_etale_algebra[field_nr][2]] do
+                for subrep_nr in [1..#all_rank_datum[field_nr][mult_index]] do
+                    output cat:= Sprintf("\nInformation about the irreducible Subtorus T_%o,%o,%o:\n", field_nr, mult_index, subrep_nr);
+                    if ds[field_nr][mult_index] eq 0 then
+                        output cat:= Sprintf("This is a Subtorus of GL_1(E_%o,%o) = GL_1(%o).\n", field_nr, mult_index, fixed_etale_algebra[field_nr][1]);
+                    elif IsSquare(ds[field_nr][mult_index]) then
+                        output cat:= Sprintf("This is a Subtorus of SU(E_%o,%o) = SU(F+F, swap), where F:=%o.\n", field_nr, mult_index, fixed_etale_algebra[field_nr][1]);
+                    else
+                        output cat:= Sprintf("This is a Subtorus of SU(E_%o,%o) = SU(F(a), sigma) where F:=%o, a:=sqrt(%o), sigma: a -> -a.\n", field_nr, mult_index,  fixed_etale_algebra[field_nr][1], ds[field_nr][mult_index]);
+                    end if;
+                    if used_primes[field_nr][mult_index][subrep_nr] gt 0 then
+                        output cat:= Sprintf("Let S := {%o}. ", used_primes[field_nr][mult_index][subrep_nr]);
+                        output cat:= Sprintf("The following is a generating set of T_%o,%o,%o(Z[S^{-1}]):\n", field_nr, mult_index, subrep_nr);
+                        output cat:= Sprint(all_generators[field_nr][mult_index][subrep_nr]);
+                    elif all_rank_datum[field_nr][mult_index][subrep_nr][0] gt 0 then
+                        output cat:= Sprint("\nThe torus is not Q-anisotropic and I could not calculate the generators of the integral points of T. The following is one generator of T:\n");
+                        output cat:= Sprint(gens[field_nr][mult_index][subrep_nr]);
+                    else
+                        output cat:= Sprintf("Let S := %o. ", Set([el: el in set_of_places]));
+                        output cat:= Sprintf("The following is a generating set of T_%o,%o,%o(Z[S^{-1}]):\n", field_nr, mult_index, subrep_nr);
+                        output cat:= Sprint(all_generators[field_nr][mult_index][subrep_nr]);
+                    end if;
+
+                    output cat:= Sprintf("\nT_%o,%o,%o has the following Ranks:\n", field_nr, mult_index, subrep_nr);
+                    output cat:= Sprintf("Q-Rank %o. ", all_rank_datum[field_nr][mult_index][subrep_nr][0]);
+                    for p in set_of_places do
+                        output cat:= Sprintf("Q_%o-Rank %o. ", p, all_rank_datum[field_nr][mult_index][subrep_nr][p]);
+                    end for;
+                    output cat:= Sprintf("\n\n\n");
+                end for;
+            end for;
+        end for;
+    end if;
+
+    // full matrix algebra for reference and the involution tau acting on it
+    R<x> := PolynomialRing(Rationals());
+    full_matrix_algebra, tau, _ := calculate_full_involution(fixed_etale_algebra, QNF(), ds, b);
+
+    // a finite list of generators for the maximal torus
+    generators_of_maximal_torus := get_generators_of_torus(get_full_torus_definition(all_irreds), gens);
+    // the algebra generated by the maximal torus
+    alg_of_max_torus := MatrixAlgebra<Rationals(), NumberOfRows(generators_of_maximal_torus[1]) | generators_of_maximal_torus>;
+
+    // actually search s-ample subtori
+    full_prod := create_subtorus_definers(all_irreds);
+    s_ample_tori := [];
+    // go over each torus in full_prod. Calculate, whether it is S-Ample
+    for torus in full_prod do
+        // skip the trivial torus
+        is_zero := true;
+        for nf_def in torus do
+            for nf_mult_ind in nf_def do
+                for subrep in nf_mult_ind do
+                    if subrep eq 0 then
+                        is_zero := false;
+                        break nf_def;
+                    end if;
+                end for;
+            end for;
+        end for;
+        if is_zero then continue torus; end if;
+
+        // the ranks of the torus we are checking
+        ranks_of_torus := ranks_of_nonirred_torus(torus, all_rank_datum, set_of_places);
+
+        // compare ranks_of_torus to ranks of subtori, check S-Ample (iii)
+        // we do this first because it is much cheaper the calculating
+        // ranks of the centraliser for condition (ii)
+        for subtorus in full_prod do
+            // skip subtorus = torus
+            if subtorus eq torus then
+                continue subtorus;
+            end if;
+            // check if  subtorus < torus is actually satisfied
+            for field_nr in [1..#fixed_etale_algebra] do
+                for mult_index in [1..fixed_etale_algebra[field_nr][2]] do
+                    for irred_index in [1..#torus[field_nr][mult_index]] do
+                        if subtorus[field_nr][mult_index][irred_index] lt torus[field_nr][mult_index][irred_index] then
+                            continue subtorus;
+                        end if;
+                    end for;
+                end for;
+            end for;
+            // subtorus < torus obtains. check if there is a place such that the rank of subtorus is smaller then that of torus
+            ranks_of_subtorus := ranks_of_nonirred_torus(subtorus, all_rank_datum, set_of_places);
+            for place in set_of_places do
+                // this subtorus has smaller rank at at least one relevant local rank
+                if not place eq 0 and ranks_of_subtorus[place] lt ranks_of_torus[place] then
+                    continue subtorus;
+                end if;
+            end for;
+            // this subtorus was maximal with respect to all relevant local ranks
+            // the torus itself cannot be S_ample
+            if VERBOSITY ge 2 then
+                irreds_appearing := [[[<i, j, s> : s in [1..#torus[i][j]] | torus[i][j][s] eq 0] : j in [1..#torus[i]]] : i in [1..#torus]];
+                irreds_appearing_flat := flatten_list(irreds_appearing);
+                output cat:= Sprintf("Let T := ");
+                for i in [1..#irreds_appearing_flat] do
+                    output cat:= Sprintf("T_%o,%o,%o", irreds_appearing_flat[i][1], irreds_appearing_flat[i][2], irreds_appearing_flat[i][3], "Minimal");
+                    if not i eq #irreds_appearing_flat then
+                        output cat:= Sprintf(" x ");
+                    end if;
+                end for;
+                output cat:= Sprintf("\n");
+                irreds_appearing_subtor := [[[<i, j, s> : s in [1..#torus[i][j]] | subtorus[i][j][s] eq 0] : j in [1..#torus[i]]] : i in [1..#torus]];
+                irreds_appearing_subtor_flat := [el : el in flatten_list(irreds_appearing_subtor)];
+                maximal_s_compact_subtorus := [el : el in irreds_appearing_flat | not el in irreds_appearing_subtor_flat];
+                output cat:= Sprintf("T is not S-ample, because its subtorus\n");
+                for i in [1..#maximal_s_compact_subtorus] do
+                    output cat:= Sprintf("T_%o,%o,%o", maximal_s_compact_subtorus[i][1], maximal_s_compact_subtorus[i][2], maximal_s_compact_subtorus[i][3], "Minimal");
+                    if not i eq #maximal_s_compact_subtorus then
+                        output cat:= Sprintf(" x ");
+                    end if;
+                end for;
+                output cat:= Sprintf("\n");
+                output cat:= Sprintf("Is S-compact.\n\n");
+            end if;
+            continue torus;
+        end for;
+
+        // a finite list of generators for torus
+        generators_of_torus := get_generators_of_torus(torus, gens);
+        alg_of_subtorus := sub<alg_of_max_torus | generators_of_torus>;
+
+        // printf "Calculating whether %o has the same ranks as its centraliser.\n", torus, "Minimal";
+        // printf "This Torus has ranks %o.\n", [ranks_of_torus[P] : P in set_of_places], "Minimal";
+        // ranks of the centraliser of torus
+
+        // first check if the torus has maximal rank among subtori
+        for P in set_of_places do
+            if not &+[&+[&+[rsub[P] : rsub in rmult] : rmult in rfield] : rfield in all_rank_datum] eq ranks_of_torus[P] then
+                if VERBOSITY ge 2 then
+                    irreds_appearing := [[[<i, j, s> : s in [1..#torus[i][j]] | torus[i][j][s] eq 0] : j in [1..#torus[i]]] : i in [1..#torus]];
+                    irreds_appearing_flat := flatten_list(irreds_appearing);
+                    output cat:= Sprintf("Let T := ");
+                    for i in [1..#irreds_appearing_flat] do
+                        output cat:= Sprintf("T_%o,%o,%o", irreds_appearing_flat[i][1], irreds_appearing_flat[i][2], irreds_appearing_flat[i][3], "Minimal");
+                        if not i eq #irreds_appearing_flat then
+                            output cat:= Sprintf(" x ");
+                        end if;
+                    end for;
+                    output cat:= Sprintf("\n");
+                    output cat:= Sprintf("T is not S-Ample, because the maximal torus has larger rank at %o.\n\n", P, "Minimal");
+                end if;
+                continue torus;
+            end if;
+        end for;
+
+        roc, restrict_type, swap_type := ranks_of_centraliser(
+            alg_of_max_torus, alg_of_subtorus, tau, set_of_places, fixed_etale_algebra, ds, b);
+        // compare roc and ranks_of_torus, check S-Ample (ii)
+        for P in set_of_places do
+            if ENABLE_SANITY_CHECKS and roc[P] lt ranks_of_torus[P] then
+                print(fixed_etale_algebra);
+                print([IsSquare(d) : d in flatten_list(ds)]);
+                print(torus);
+
+                print("algebra");
+                print(restrict_type);
+                print(swap_type);
+
+                print([roc[P] : P in set_of_places]);
+                print([ranks_of_torus[P]: P in set_of_places]);
+                print([[el[p] : p in set_of_places] : el in flatten_list(all_rank_datum)]);
+                _ := ["Internal Error. See the debug output above.", <1>];
+            end if;
+            if roc[P] gt ranks_of_torus[P] then
+                if VERBOSITY ge 2 then
+                    irreds_appearing := [[[<i, j, s> : s in [1..#torus[i][j]] | torus[i][j][s] eq 0] : j in [1..#torus[i]]] : i in [1..#torus]];
+                    irreds_appearing_flat := flatten_list(irreds_appearing);
+                    output cat:= Sprintf("Let T := ");
+                    for i in [1..#irreds_appearing_flat] do
+                        output cat:= Sprintf("T_%o,%o,%o", irreds_appearing_flat[i][1], irreds_appearing_flat[i][2], irreds_appearing_flat[i][3], "Minimal");
+                        if not i eq #irreds_appearing_flat then
+                            output cat:= Sprintf(" x ");
+                        end if;
+                    end for;
+                    output cat:= Sprintf("\n");
+                    output cat:= Sprintf("T is not S-Ample, because its centraliser has larger rank at %o.\n", P, "Minimal");
+                    restrict_type := [el : el in restrict_type | el[2] gt 0];
+                    swap_type := [el : el in swap_type | el[2] gt 0];
+                    output cat:= Sprintf("Its centraliser C is isomorphic to ");
+                    if #restrict_type gt 0 then
+                        output cat:= Sprintf("C_R");
+                    end if;
+                    if #restrict_type gt 0 and #swap_type gt 0 then
+                        output cat:= Sprintf(" + ");
+                    end if;
+                    if #swap_type gt 0 then
+                        output cat:= Sprintf("C_S^2");
+                    end if;
+                    output cat:= Sprintf("\nWhere ");
+                    if #restrict_type gt 0 then
+                        output cat:= Sprintf("C_R := ");
+                        for rindex in [1..#restrict_type] do
+                            output cat:= Sprintf("M_%o(%o)", restrict_type[rindex][2], restrict_type[rindex][1]);
+                            if not rindex eq #restrict_type then
+                                output cat:= Sprintf(" + ");
+                            end if;
+                        end for;
+                        output cat:= Sprintf(" and the involution restricts on each simple component\n");
+                    end if;
+                    if #restrict_type gt 0 and #swap_type gt 0 then
+                        output cat:= Sprintf(" and ");
+                    end if;
+                    if #swap_type gt 0 then
+                        output cat:= Sprintf("C_S := ");
+                        for rindex in [1..#swap_type] do
+                            output cat:= Sprintf("M_%o(%o)", swap_type[rindex][2], swap_type[rindex][1]);
+                            if not rindex eq #swap_type then
+                                output cat:= Sprintf(" + ");
+                            end if;
+                        end for;
+                        output cat:= Sprintf(" and the involution swaps the two copies of C_S.\n");
+                    end if;
+                    output cat:= Sprintf("C has rank %o at Place %o, but T only has rank %o.\n\n", roc[P], P, ranks_of_torus[P], "Minimal");
+                end if;
+                continue torus;
+            end if;
+        end for;
+        if VERBOSITY ge 1 then
+            irreds_appearing := [[[<i, j, s> : s in [1..#torus[i][j]] | torus[i][j][s] eq 0] : j in [1..#torus[i]]] : i in [1..#torus]];
+            irreds_appearing_flat := flatten_list(irreds_appearing);
+            output cat:= Sprintf("Let T := ");
+                for i in [1..#irreds_appearing_flat] do
+                    output cat:= Sprintf("T_%o,%o,%o", irreds_appearing_flat[i][1], irreds_appearing_flat[i][2], irreds_appearing_flat[i][3], "Minimal");
+                    if not i eq #irreds_appearing_flat then
+                        output cat:= Sprintf(" x ");
+                    end if;
+                end for;
+            output cat:= Sprintf("\n");
+            output cat:= Sprint("T is S-Ample.");
+        end if;
+        // this torus is actually s-ample in the minimal Levi-Group containing its center
+        Append(~s_ample_tori, torus);
+    end for;
+    return s_ample_tori, output;
+end function;
+
+// TODO DOCU FOR ALL THIS
+
+function single_etale_algebra_auto_coercion(fixed_etale_algebra, ds, b_noncoerced, set_of_places)
+    Es := [**];
+    for field_nr in [1..#fixed_etale_algebra] do
+        F := fixed_etale_algebra[field_nr][1];
+        mult := fixed_etale_algebra[field_nr][2];
+        Append(~Es, [**]);
+        for mult_index in [1..mult] do
+            if IsSquare(ds[field_nr][mult_index]) then
+                Append(~Es[field_nr], F);
+            else
+                Q<x> := PolynomialRing(F);
+                Append(~Es[field_nr], ext<F | x^2 - ds[field_nr][mult_index] : Global:=true>);
+            end if;
+        end for;
+    end for;
+
+    b := [**];
+    for field_nr in [1..#fixed_etale_algebra] do
+        Append(~b, [**]);
+        for mult_index in [1..fixed_etale_algebra[field_nr][2]] do
+            if ds[field_nr][mult_index] eq 0 then
+                Append(~b[field_nr], Es[field_nr][mult_index] ! b_noncoerced[field_nr][mult_index]);
+            elif IsSquare(ds[field_nr][mult_index]) then
+                Append(~b[field_nr], [**]);
+                for swap_index in [1..2] do
+                    Append(~b[field_nr][mult_index], b_noncoerced[field_nr][mult_index][swap_index]);
+                end for;
+            else
+                Append(~b[field_nr], Es[field_nr][mult_index] ! b_noncoerced[field_nr][mult_index]);
+            end if;
+        end for;
+    end for;
+
+    own_output := "";
+    if VERBOSITY ge 1 then
+        own_output cat:= "Searching for S-Ample Subtori in the direct sum of the following etale Q-algebras:";
+        for field_nr in [1..#fixed_etale_algebra] do
+            for mult_index in [1..fixed_etale_algebra[field_nr][2]] do
+                if ds[field_nr][mult_index] eq 0 then
+                    own_output cat:= Sprintf("E_%o,%o := %o\nWith the trivial involution.\n", field_nr, mult_index, fixed_etale_algebra[field_nr][1]);
+                elif IsSquare(ds[field_nr][mult_index]) then
+                    own_output cat:= Sprintf("E_%o,%o := F+F where F:=%o\nWith the involution swapping the two Summands.\n", field_nr, mult_index, fixed_etale_algebra[field_nr][1]);
+                else
+                    own_output cat:= Sprintf("E_%o,%o := F(a) where F:=%o, a := sqrt(%o)\nWith the involution a -> -a.\n", field_nr, mult_index, fixed_etale_algebra[field_nr][1], ds[field_nr][mult_index]);
+                end if;
+            end for;
+        end for;
+    end if;
+    res, output := find_S_ample_subtori(fixed_etale_algebra, ds, b, set_of_places);
+    return res, own_output cat output;
+end function;
+
+procedure script()
+    Q<x> := PolynomialRing(Rationals());
+
+    // Change the Etale Algebra in this Block
+    set_of_places := [Infinity(), 3];
+    F1 := RationalsAsNumberField();
+    F2 := NumberField(x^2 + 1 : Abs:=true);
+    fixed_etale_algebra := [<F1, 2>, <F2, 2>];
+    ds := [[0, -1], [4, 0]];
+    b_noncoerced := [*[*1, 2*], [*[*1, 1*], 1*]*];
+    // The Remainder is automated
+
+    single_etale_algebra_auto_coercion(fixed_etale_algebra, ds, b_noncoerced, set_of_places);
+end procedure;
+
+function random_element(max_coefficient : basering:=Rationals(), nonzero:=true)
+    while true do
+        el := &+[Basis(basering)[i] * Random(-max_coefficient, max_coefficient) : i in [1..Degree(basering)]];
+        if (not nonzero) or (not el eq 0) then
+            return el;
+        end if;
+    end while;
+end function;
+
+function random_irred_polynomial(max_coefficient, degree : basering:=Rationals())
+    // I do not know of a good way to do this more efficiently :(
+    while true do
+        coeffs := [random_element(max_coefficient : basering:=basering) : i in [1..degree]];
+        f := Polynomial(coeffs cat [1]);
+        if IsIrreducible(f) then
+            return f;
+        end if;
+    end while;
+end function;
+
+function random_search_single(filter)
+    MAX_COEFFICIENT := 8;
+
+    // Minimal Number of finite places in set_of_places
+    MIN_NUMBER_OF_FINITE_PLACES := 0;
+    // Maximal Number of finite places in set_of_places
+    MAX_NUMBER_OF_FINITE_PLACES := 3;
+    // The maximal Index of the chosen finite place in [2, 3, 5, ...]
+    MAX_INDEX_OF_FINITE_PLACES := 10;
+
+    // The maximum Number of Fixed Fields of the Etale-Algebra
+    MAX_NUMBER_OF_FIXED_FIELDS := 2;
+    // The maximum Degree of the fixed Field F|Q
+    MAX_DEGREE_OF_FIXED_FIELDS := 2;
+
+    // weight to get a trivial involution E=F, sigma=id
+    TRIVIAL_INVOLUTION_WEIGHT := 0;
+    // weight to get an involution of type E=F+F, sigma = swap
+    SWAP_INVOLUTION_WEIGHT := 5;
+    // weight to get an involution of type E=F[sqrt(d)], sigma(sqrt(d)) = - sqrt(d)
+    EXTENSION_INVOLUTION_WEIGHT := 10;
+
+
+    // -1 : only skew-hermitian b, 0: both, 1: only hermitian b
+    // if this is -1 or we randomly chose a Fixed field with trivial involution, then TRIVIAL_INVOLUTION_WEIGHT is overridden to be 0!
+    // i.e. the EPSILONESS_OF_TRACEFORM  takes precedence over TRIVIAL_INVOLUTION_WEIGHT
+    EPSILONESS_OF_TRACEFORM := -1;
+
+    // EPSILON eq 1 and SUM(WEIGHTS) > 0
+    // or EPSILON neq 1 and SWAP_INVOLUTION_WEIGHT + EXTENSION_INVOLUTION_WEIGHT > 0
+    // must be satisfied!!!
+
+    seed, times_used := GetSeed();
+
+    // create random set of places
+    set_of_places := [];
+    number_of_finite_places := Random(MIN_NUMBER_OF_FINITE_PLACES, MAX_NUMBER_OF_FINITE_PLACES);
+    for i in [1..number_of_finite_places] do
+        // get a random prime and add it
+        prime_index := Random(MAX_INDEX_OF_FINITE_PLACES);
+        p := 2;
+        for j in [1..prime_index] do
+            p := NextPrime(p);
+        end for;
+        while true do
+            if not p in set_of_places then
+                Append(~set_of_places, p);
+                break;
+            end if;
+            p := NextPrime(p);
+        end while;
+    end for;
+    set_of_places := [*Infinity()*] cat [*el : el in set_of_places*];
+
+
+    // the random number of fixed fields:
+    number_of_fixed_fields := MAX_NUMBER_OF_FIXED_FIELDS; // Random(1, MAX_NUMBER_OF_FIXED_FIELDS);
+    Fs := [];
+    ds := [**];
+    bs := [**];
+
+    // the bs have to be chosen such that
+    if EPSILONESS_OF_TRACEFORM eq -1 then
+        epsilon := -1;
+    elif EPSILONESS_OF_TRACEFORM eq 1 then
+        epsilon := 1;
+    else
+        epsilon := [1, -1][Random(1, 2)];
+    end if;
+
+    if epsilon eq -1 then
+        TRIVIAL_INVOLUTION_WEIGHT := 0;
+    end if;
+
+    for i in [1..number_of_fixed_fields] do
+        // generate the fixed field
+        degree := 3; // Random(1, MAX_DEGREE_OF_FIXED_FIELDS);
+        // f := CyclotomicPolynomial(Random(1, MAX_DEGREE_OF_FIXED_FIELDS));
+        f := random_irred_polynomial(MAX_COEFFICIENT, degree);
+        F := NumberField(f : DoLinearExtension:=true);
+        Append(~Fs, <F, 1>);
+        // generate the involution on the fixed field
+        type_roll := Random(1, TRIVIAL_INVOLUTION_WEIGHT + SWAP_INVOLUTION_WEIGHT + EXTENSION_INVOLUTION_WEIGHT);
+        if type_roll le TRIVIAL_INVOLUTION_WEIGHT then
+            // TRIVIAL-Involution
+            Append(~ds, [0]);
+            // form is automatically symmetric (forall b : id(b) = b)
+            Append(~bs, random_element(MAX_COEFFICIENT : basering:=F));
+        elif type_roll le TRIVIAL_INVOLUTION_WEIGHT + SWAP_INVOLUTION_WEIGHT then
+            // SWAP-Involution
+            Append(~ds, [4]);
+            b := random_element(MAX_COEFFICIENT : basering:=F, nonzero:=true);
+            if epsilon eq 1 then
+                // choose the same element twice
+                Append(~bs, [[b, b]]);
+            else
+                // choose an element and its inverse
+                Append(~bs, [[b, -b]]);
+            end if;
+        else
+            // EXTENSION-Involution
+            while true do
+                d := random_element(MAX_COEFFICIENT : basering:=F);
+                if not IsSquare(d) then
+                    R<x> := PolynomialRing(F);
+                    E := ext<F | x^2 - d : Global:=true>;
+                    break;
+                end if;
+            end while;
+            Append(~ds, [d]);
+            if epsilon eq 1 then
+                // choose b in F
+                Append(~bs, [E ! random_element(MAX_COEFFICIENT : basering:=F, nonzero:=true)]);
+            else
+                // choose b in sqrt(d) * F
+                Append(~bs, [E ! E.1 * random_element(MAX_COEFFICIENT : basering:=F, nonzero:=true)]);
+            end if;
+        end if;
+    end for;
+
+    res, output := single_etale_algebra_auto_coercion(Fs, ds, bs, set_of_places);
+    nontrivial_subtori := [**];
+    if #res gt 0 then
+        for torus in res do
+            for field_nr in [1..#Fs] do
+                for mult_index in [1..Fs[field_nr][2]] do
+                    for subrep_taken in torus[field_nr][mult_index] do
+                        if subrep_taken ge 1 then
+                            Append(~nontrivial_subtori, torus);
+                            continue torus;
+                        end if;
+                    end for;
+                end for;
+            end for;
+        end for;
+    end if;
+    if not filter or #nontrivial_subtori gt 0 then
+        print("\n\n===Seed for this repeat===");
+        printf "SetSeed(%o, %o)\n", seed, times_used, "Minimal";
+        print("\n");
+        printf "We have nontrivial S-ample subtori \n";
+        print(output);
+    end if;
+
+    return res;
+end function;
+
+function random_search()
+    // Number of etale algebras to generate with these parameters
+    REPEATS := 1;
+    // suppress output when no nontrivial s-ample subtorus was found (the filter defined in random_search_single)
+    FILTER := false;
+
+    res := [**];
+    for r in [1..REPEATS] do
+        sing_res := random_search_single(FILTER);
+        Append(~res, sing_res);
+    end for;
+    return res;
+end function;
+
+SetSeed(56727199);
+
+tmp := random_search();
+print(tmp);
