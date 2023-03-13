@@ -2656,7 +2656,7 @@ function find_S_ample_subtori(fixed_etale_algebra, ds, b, set_of_places)
                     output cat:= Sprintf("T is not S-Ample, because its centraliser has larger rank at %o.\n", P, "Minimal");
                     restrict_type := [el : el in restrict_type | el[2] gt 0];
                     swap_type := [el : el in swap_type | el[2] gt 0];
-                    output cat:= Sprintf("Its centraliser C is isomorphic to ");
+                    output cat:= Sprintf("Its centraliser C is isomorphic to the product of SUs of ");
                     if #restrict_type gt 0 then
                         output cat:= Sprintf("C_R");
                     end if;
