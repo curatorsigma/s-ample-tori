@@ -958,9 +958,10 @@ function galois_representation_w_involution_ext(F, d, E, Ehat, Fhat)
     // now calculate the image of X_F under the pullback along the norm
     f_F := DefiningPolynomial(F);
     // Magma is weird
-    Embed(Fhat, Ehat, Roots(DefiningPolynomial(Fhat), Ehat)[1][1]);
-    IsSubfield(Fhat, Ehat);
-    IsSubfield(E_abs, Ehat);
+    if not IsSubfield(Fhat, Ehat) then
+        Embed(Fhat, Ehat, Roots(DefiningPolynomial(Fhat), Ehat)[1][1]);
+    end if;
+    _ := IsSubfield(E_abs, Ehat);
     // find the roots of f_F in Fhat
     betas := [el[1] : el in Roots(f_F, Fhat)];
     // these roots form a Basis of the Characters of F
