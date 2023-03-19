@@ -1779,7 +1779,7 @@ function calculate_form_of_involution(tau, q_basis_of_l, tau_on_q_basis_of_l, L)
                 continue j;
             end if;
             // we now have an element of q which is not zero. It gives us an equation, x needs to satisfy
-            // this equation is x * q_prescale[i][j] = tau(x) * q_prescale[j][i]
+            // this equation is x * q_prescale[i][j] = tau(x * q_prescale[j][i])
             Append(~list_of_scale_equations, [
                 (q_basis_of_l[lindex] * q_prescale[i][j] - tau_on_q_basis_of_l[lindex] *
                  &+[tau_on_q_basis_of_l[linner] * coordinates_in_basis_fld(q_prescale[j][i], q_basis_of_l)[linner] :
