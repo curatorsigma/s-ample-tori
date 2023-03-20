@@ -108,6 +108,84 @@ function frobenius_block_of_polynomial(poly :  field:=Rationals())
     return Transpose(Matrix(field, n, n, columns));
 end function;
 
+function primitize_pair(a, b, M)
+    // Find a primitive element for Q(a, b)
+    //
+    // INPUTS
+    //  Matrix a
+    //  Matrix b
+    //  MatrixAlgebra M in which a and b lie
+    // OUTPUTS
+    //  Matrix d such that d and {a, b} generate the same subset of M as matrices
+    // ASSUMPTIONS
+    //  a and b must commute and span_Q <a, b> must be an integral domain (i.e. isomorphic to a number field)
+    c := 0;
+    while true do
+        common_subalg := sub<M | a + c * b>;
+        if a in common_subalg and b in common_subalg then
+            return a + b * c;
+        end if;
+        c +:= 1;
+        // there is always a small c which works
+        if c gt Dimension(M) + 1 then
+            print("Could not find a primitive element for");
+            print(M);
+            print(a);
+            print(b);
+            _ := ["Internal Error. See the output above.", <1>];
+        end if;
+    end while;
+end function;
+
+function find_primitive_element(M)
+    // Calculate a primitive element of M, i.e. x such that Q(x) = M
+    //
+    // INPUTS
+    //  MatrixAlgebra M over Q
+    // OUTPUTS
+    //  Matrix x in M such that Q(x) = M
+    // ASSUMPTIONS
+    //  M must be isomorphic to a number field
+
+end function;
+
+function find_isomorphic_field(M)
+    // Computes the numberfield M is isomorphic to
+    //
+    // INPUTS
+    //  MatrixAlgebra M over Q isomorphic to a numberfield
+    // OUTPUTS
+    //  FldNum that M is isomorphic to as a Q-algebra
+    // ASSUMPTIONS
+    //  M must be isomorphic to a numberfield (commutative and integral domain)
+
+    // first find a primitive element of M
+    B := Basis(M);
+    // B has dimension 1 over Q, i.e. it is Q itself
+    if #B eq 1 then
+        return QNF();
+    end if;
+
+    prim_elt := B[1];
+    for i in [2..#B] do
+        prim_elt := primitize_pair(prim_elt, B[i], M);
+    end for;
+
+    // we now know that prim_elt is primitive (i.e. Q(prim_elt) \cong M) and the field is not Q.
+    // create the field
+    m := MinimalPolynomial(prim_elt);
+    non_trivial_factors := [fact[1] : fact in Factorization(m) | Degree(fact[1]) gt 1];
+    if not #non_trivial_factors eq 1 then
+        print("Could not find a primitive elment for M");
+        print(M);
+        print(m);
+        print("this polynomial has to many nontrivial irreducible factors, namely:");
+        print(non_trivial_factors);
+        _ := ["Internal Error. See the output above.", <1>];
+    end if;
+    return NumberField([non_trivial_factors[1]] : DoLinearExtension:=true);
+end function;
+
 function eval_involution(tau, x)
     // INPUTS
     //      Rational n^2xn^2-Matrix tau: action of the involution on the basiselements of the full matrix algebra
@@ -1487,7 +1565,6 @@ function restriction_of_L_form_to_K(q, L, K)
     M := RelativeField(K, L);
     // find a such that L = K(a) and a^2 in K
     // take the minimal polynomial (i.e. M.1^2 + x M.1 + y = 0) with x, y in K
-    // TODO WU [https://math.stackexchange.com/questions/2494309/field-extension-with-degree-2] defines this algorithm
     coeffs := Coefficients(MinimalPolynomial(M.1, K));
     alpha := M.1 + coeffs[2] / 2;
     K_basis_of_M := [M ! 1, alpha];
@@ -1611,8 +1688,6 @@ function is_hermitian(q, L, K)
     //      BoolElt (true if q is hermitian, false if q is skew-hermitian)
 
     // get the involution on L
-    // TODO: something is not consistent here
-    // probably because we specifically chose the involution to map L.1 -> - L.1 or something like that
     G, _, iota_G := AutomorphismGroup(L, K);
     theta := iota_G(Random(Generators(G)));
 
@@ -1716,8 +1791,6 @@ function local_witt_indices(q, set_of_places, L, K)
     return ranks;
 end function;
 
-
-// TODO WU, dass das die richtigen Gleichungen sind und warum eine Lösung garantiert eindeutig existiert
 function calculate_form_of_involution(tau, q_basis_of_l, tau_on_q_basis_of_l, L)
     // Calculate the hermitian form corresponding to the involution tau
     // INPUTS
@@ -1771,7 +1844,6 @@ function calculate_form_of_involution(tau, q_basis_of_l, tau_on_q_basis_of_l, L)
     end if;
 
     // This involution is of the second kind, so we need to rescale to be hermitian
-    // TODO WU, dass das die richtigen Gleichungen sind
     list_of_scale_equations := [];
     for i in [1..n] do
         for j in [i+1..n] do
@@ -1824,7 +1896,6 @@ function calculate_form_of_involution(tau, q_basis_of_l, tau_on_q_basis_of_l, L)
     return q;
 end function;
 
-// TODO WU in chap:Implementation
 function find_primitive_element_with_canonical_involution(q_basis_of_l, tau_on_q_basis_of_l)
     mu := [coordinates_in_basis_fld(tau_on_q_basis_of_l[i], q_basis_of_l) : i in [1..#q_basis_of_l]];
     m := Matrix(Rationals(), [[((i eq j) select 1 else 0) + mu[j][i] : j in [1..#q_basis_of_l]] : i in [1..#q_basis_of_l]]);
@@ -1981,13 +2052,7 @@ function ranks_of_centraliser_summand(K_realized, E_realized, set_of_places, ds_
     //  The field K, K_realized is isomorphic to
     //  The fixed field F under the involution on K_realized
 
-    K := QNF();
-    for gen in Generators(K_realized) do
-        for f in Factorization(MinimalPolynomial(gen)) do
-            K := CompositeFields(K, NumberField(f[1]))[1];
-        end for;
-    end for;
-    K := OptimizedRepresentation(K);
+    K := find_isomorphic_field(K_realized);
 
     // get the involution
     M, tau, q_basis_of_k := calculate_full_involution(E_realized, K, ds_on_E, b_on_E);
@@ -2067,7 +2132,6 @@ function calculate_central_idempotents(fixed_etale_algebra, ds)
     return central_idempotents;
 end function;
 
-// TODO WU, dass diese injectionen alle existieren und das jedes K entweder reiner swap oder invarianter gemischter typ ist
 function find_single_injection_data(K_realized, central_idempotents)
     // Find the parts of fixed_etale_algebra that K_realized injects into
     //
@@ -2259,13 +2323,7 @@ function ranks_of_centraliser(alg_of_max_torus, alg_of_subtorus, tau, set_of_pla
                 Append(~ignore_Ks, compare_index);
             end if;
         end for;
-        K := QNF();
-        for gen in Basis(swap_type_Ks[K_index][1]) do
-            for f in Factorization(MinimalPolynomial(gen)) do
-                K := CompositeFields(K, NumberField(f[1]))[1];
-            end for;
-        end for;
-        K := OptimizedRepresentation(K);
+        K := find_isomorphic_field(swap_type_Ks[K_index][1]);
 
         // The dimension of the GL_n(K) we need the rank of
         dimension := Floor(&+[Degree(fixed_etale_algebra[tup[1]][1], Rationals()) / Degree(K, Rationals()) :
@@ -2319,9 +2377,6 @@ function ranks_of_centraliser(alg_of_max_torus, alg_of_subtorus, tau, set_of_pla
     return ranks, restrict_type, swap_type;
 end function;
 
-// TODO WU
-//  - ganzes Verfahren in dieser Funktion durchschauen, vielleicht ist was relevantes dabei
-//  - warum finden wir bis auf konjugation alle S-amplen subtori auf die Art?
 function find_S_ample_subtori(fixed_etale_algebra, ds, b, set_of_places)
     // Find all S-ample subtori of fixed_etale_algebra[sqrt(ds)] with the twisted traceform given by b
     //
@@ -2880,7 +2935,7 @@ function random_search_single(filter)
 
     for i in [1..number_of_fixed_fields] do
         // generate the fixed field
-        degree := 3; // Random(1, MAX_DEGREE_OF_FIXED_FIELDS);
+        degree := Random(1, MAX_DEGREE_OF_FIXED_FIELDS);
         // f := CyclotomicPolynomial(Random(1, MAX_DEGREE_OF_FIXED_FIELDS));
         f := random_irred_polynomial(MAX_COEFFICIENT, degree);
         F := NumberField(f : DoLinearExtension:=true);
@@ -2964,8 +3019,6 @@ function random_search()
     end for;
     return res;
 end function;
-
-SetSeed(56727199);
 
 tmp := random_search();
 print(tmp);
